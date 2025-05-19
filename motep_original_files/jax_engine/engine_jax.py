@@ -4,7 +4,7 @@ from ..base import EngineBase
 from ..data import MTPData
 
 from .conversion import BasisConverter, moments_count_to_level_map
-from .jax_jax_sp import calc_energy_forces_stress as jax_calc
+from .jax_jax_sym import calc_energy_forces_stress as jax_calc
 from .moment_jax import MomentBasis
 
 
