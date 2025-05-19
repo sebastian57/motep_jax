@@ -93,21 +93,10 @@ def main():
         elif args.train3 == 'true':
             epoch_carry, epoch_losses, steps_performed, loss_history = train3(args.training_cfg, level, args.steps1, args.steps2) 
         elif args.train4 == 'true':
-            tracemalloc.start()
-            profiler.start_trace('logdir/')
-
-
-
             epoch_carry, epoch_losses, steps_performed, loss_history, val_loss_history = train4(args.training_cfg, level, args.steps1, args.threshold_loss, args.min_steps, 
                                                                                                 args.lr_start, args.transition_steps, args.decay_rate, args.global_norm_clip, 
                                                                                                 min_dist = args.min_dist, max_dist = args.max_dist, scaling = args.scaling,
                                                                                                 species=species, pkl_file = args.pkl_file, pkl_file_val = args.pkl_file_val) 
-            snapshot = tracemalloc.take_snapshot()
-            top_stats = snapshot.statistics('lineno')
-            current, peak = tracemalloc.get_traced_memory()
-            profiler.stop_trace()
-
-            print(f"Current: {current/1024**2:.2f} MB; Peak: {peak/1024**2:.2f} MB")
             
             params = epoch_carry['params']
             #write_mtp_file(level,species,params,file)
