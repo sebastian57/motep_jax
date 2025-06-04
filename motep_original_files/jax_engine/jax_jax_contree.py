@@ -9,16 +9,21 @@ import numpy.typing as npt
 from ase import Atoms
 import math
 
-from jax.experimental import sparse
-from jax.experimental.sparse import BCOO, bcoo_dot_general, bcoo_transpose, coo_matvec
-
-import pickle
-import itertools
-from itertools import permutations
+from jax.experimental.sparse import BCOO, bcoo_dot_general
 
 jax.config.update("jax_enable_x64", False)
 
+class ContractionNode:
+    def __init__(self, key, kind):
+        self.key = key
+        self.kind = kind       
+        self.left = None        
+        self.right = None       
+        self.axes = None       
+        self.result = None     
 
+    def __repr__(self):
+        return f"<Node {self.key} ({self.kind})>"
 
 def get_types(atoms: Atoms, species: list[int] = None) -> npt.NDArray[np.int64]:
     if species is None:
@@ -185,50 +190,11 @@ def _jax_calc_local_energy(
         * smoothing
         * jnp.einsum("jmn, jn -> mj", radial_coeffs[itype, jtypes], radial_basis)
     )
-
     basis = _jax_calc_basis(
         r_ijs, r_abs, rb_values, basic_moments, pair_contractions, scalar_contractions
     )
     energy = species_coeffs[itype] + jnp.dot(moment_coeffs, basis)
     return energy
-
-
-@partial(jax.jit, static_argnums=(3, 4, 5))
-def _jax_calc_basis(
-    r_ijs,
-    r_abs,
-    rb_values,
-    # Static parameters:
-    basic_moments,
-    pair_contractions,
-    scalar_contractions
-):
-    calculated_moments, nus = _jax_calc_moments(r_ijs, r_abs, rb_values, basic_moments)
-
-    for contraction in pair_contractions:
-
-        m1 = calculated_moments[contraction[0]]
-        nu1 = nus[contraction[0]]
-
-        m2 = calculated_moments[contraction[1]]
-        nu2 = nus[contraction[1]]
-
-        if nu1 >= 2:
-            m1 = reconstruct_symmetric_tensor_scan(m1[0],m1[1],nu1)
-        if nu2 >= 2:
-            m2 = reconstruct_symmetric_tensor_scan(m2[0],m2[1],nu2)
-
-        calculated_moments[contraction], nus[contraction] = _jax_contract_over_axes(
-            m1, m2, contraction[3]
-        )
-
-    basis = []
-    for contraction in scalar_contractions:
-        b = calculated_moments[contraction]
-        basis.append(b)
-        #print(b)
-    
-    return jnp.array(basis)
 
 
 #@partial(jax.jit, static_argnums=[1, 2, 3])
@@ -242,71 +208,104 @@ def _jax_chebyshev_basis(r, number_of_terms, min_dist, max_dist):
     return jnp.array(rb)
 
 
-#@partial(jax.jit, static_argnums=(3,))
-def _jax_calc_moments(r_ijs, r_abs, rb_values, moments):
-    
-    calculated_moments = {}
-    nus = {}
-    r_ijs_unit = (r_ijs.T / r_abs).T
-
-    for moment in moments:
-        mu = moment[0]
-        nu = moment[1]
-        m = _jax_make_tensor(r_ijs_unit, nu)
-        
-        m = (m.T * rb_values[mu]).sum(axis=-1)
-
-        if nu >= 2: 
-            m = extract_unique_optimized(m)
-          
-        calculated_moments[moment] = m
-        nus[moment] = nu
-    
-    return calculated_moments, nus
-
-
-
 @partial(jax.vmap, in_axes=[0, None], out_axes=0)
 def _jax_make_tensor(r, nu):
     m = 1
     for _ in range(nu):
         m = jnp.tensordot(r, m, axes=0)
-    
+        
     return m
 
+#@partial(jax.jit, static_argnums=(2,))
 def _jax_contract_over_axes(m1, m2, axes):
-
+    #jax.debug.print('axes: {}', axes)
     calculated_contraction = jnp.tensordot(m1, m2, axes=axes)
-
-    nu = calculated_contraction.ndim
-
-    if nu >= 2:
-        calculated_contraction = extract_unique_optimized(calculated_contraction)
-
-    return calculated_contraction, nu
+    return calculated_contraction
 
 
-@jax.jit
-def extract_unique_optimized(sym_tensor):
-    order = sym_tensor.ndim
-    dim = sym_tensor.shape[0]
-    unique_indices = jnp.array(list(itertools.combinations_with_replacement(range(dim), order)))
-    unique_elements = sym_tensor[tuple(unique_indices.T)]
-    return unique_elements, unique_indices
+def _create_roots(basic_moments, pair_contractions, scalar_contractions):
+    nodes = {}
+
+    for moment_key in basic_moments:
+        nodes[moment_key] = ContractionNode(key=moment_key, kind='basic')
+
+    for contraction_key in pair_contractions:
+        nodes[contraction_key] = ContractionNode(key=contraction_key, kind='contract')
+
+    for contraction_key in pair_contractions:
+        node = nodes[contraction_key]           
+        key_left, key_right, _, (axes_left, axes_right) = contraction_key
+
+        node.left = nodes[key_left]             
+        node.right = nodes[key_right]           
+        node.axes = (axes_left, axes_right)     
+
+    root_keys = set()
+    for S in scalar_contractions:
+        root_keys.add(S)
+
+    root_nodes = [nodes[k] for k in root_keys]
+
+    return nodes, root_nodes
+
+def _clear_all_results(nodes_dict):
+    for node in nodes_dict.values():
+        node.result = None
+
+def _evaluate_node(node, r, rb_values):
+    if node.result is not None:
+        return node.result
+
+    if node.kind == 'basic':
+        mu, nu, _ = node.key
+
+        full_tensor = _jax_make_tensor(r, nu)
+
+        small_tensor = (full_tensor.T * rb_values[mu]).sum(axis=-1)
+
+        node.result = small_tensor
+        return small_tensor
+
+    if node.kind == 'contract':
+        left_val = _evaluate_node(node.left, r, rb_values)
+        right_val = _evaluate_node(node.right, r, rb_values)
+
+        axes_left, axes_right = node.axes
+
+        out = _jax_contract_over_axes(left_val, right_val, (axes_left, axes_right))
+
+        node.result = out
+        return out
+
+    raise ValueError(f"Unknown node.kind = {node.kind!r} for key = {node.key!r}")
+
+def _compute_basis_for_atom(r, rb_values, nodes_dict, root_nodes):
+   
+    _clear_all_results(nodes_dict)
+
+    basis_vals = []
+    for root in root_nodes:
+        scalar_val = _evaluate_node(root, r, rb_values)
+        basis_vals.append(scalar_val)
+    return jnp.stack(basis_vals) 
+
+#@partial(jax.jit, static_argnums=(3, 4, 5))
+def _jax_calc_basis(
+    r_ijs,
+    r_abs,
+    rb_values,
+    # Static parameters:
+    basic_moments,
+    pair_contractions,
+    scalar_contractions,
+):
+    r = (r_ijs.T / r_abs).T
+
+    nodes, root_nodes = _create_roots(basic_moments, pair_contractions, scalar_contractions)
+
+    basis = _compute_basis_for_atom(r, rb_values, nodes, root_nodes)
+    
+    return basis
 
 
-@partial(jax.jit, static_argnums=(2))
-def reconstruct_symmetric_tensor_scan(unique_elements, unique_indices, nu):
 
-    shape = tuple([3]*nu)
-
-    def body(tensor, carry):
-        idx, val = carry
-        perms = jnp.array(list(permutations(idx)))    
-        tensor = tensor.at[tuple(perms.T)].set(val)
-        return tensor, None
-
-    tensor, _ = lax.scan(body,
-                         jnp.zeros(shape, dtype=unique_elements.dtype),
-                         (unique_indices, unique_elements))
-    return tensor

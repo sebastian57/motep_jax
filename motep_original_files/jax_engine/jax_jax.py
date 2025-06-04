@@ -260,7 +260,7 @@ def _jax_make_tensor(r, nu):
 
 #@partial(jax.jit, static_argnums=(2,))
 def _jax_contract_over_axes(m1, m2, axes):
-    #jax.debug.print('axes: {}', axes)
+    jax.debug.print('axes: {}', axes)
     calculated_contraction = jnp.tensordot(m1, m2, axes=axes)
     return calculated_contraction
 
