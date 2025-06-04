@@ -4,9 +4,9 @@ set -e
 PYTHON_EXE="python3" 
 SCRIPT_PATH="./motep_jax_analysis.py" 
 
-FOLDER_NAME="train4_sparse" 
-RUN_NAME="train4_sparse"
-OUTPUT_NAME="train4_sparse_report"
+FOLDER_NAME="train4_contree" 
+RUN_NAME="train4_contree"
+OUTPUT_NAME="train4_contree_report"
 THRESHOLD_LOSS=3.2241e-06
 MIN_STEPS=10
 LR_START=3e-1
