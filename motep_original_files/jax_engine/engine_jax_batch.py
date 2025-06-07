@@ -4,17 +4,19 @@ from ..base import EngineBase
 from ..data import MTPData
 
 from .conversion import BasisConverter, moments_count_to_level_map
-from .jax_jax_opt import calc_energy_forces_stress as jax_calc
+from .jax_jax_batch import calc_energy_forces_stress_batch_optimized as jax_calc_batch
 from .moment_jax import MomentBasis
 
 
 class JaxMTPEngine(EngineBase):
-    """MTP Engine in 'full tensor' version based on jax."""
+    """MTP Engine in 'full tensor' version based on jax with batch optimization."""
 
     def __init__(self, *args, **kwargs):
         """Intialize the engine."""
         self.moment_basis = None
         self.basis_converter = None
+        # Add flag to control which version to use
+        self.use_batch_optimization = kwargs.pop('use_batch_optimization', True)
         super().__init__(*args, **kwargs)
 
     def update(self, mtp_data: MTPData) -> None:
@@ -35,7 +37,7 @@ class JaxMTPEngine(EngineBase):
             
             
     def calculate(self, itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, params):
-        #self.update_neighbor_list(atoms)
+        """Calculate energy, forces, and stress with batch optimization."""
         mtp_data = self.mtp_data
         
         # set params for gradient computation
@@ -43,12 +45,20 @@ class JaxMTPEngine(EngineBase):
         mtp_data.radial_coeffs = params['radial']
         self.basis_converter.remapped_coeffs = params['basis']
         
-        energies, forces, stress = jax_calc(
+        # Use batch-optimized calculation
+        if self.use_batch_optimization:
+            calc_func = jax_calc_batch
+        else:
+            # Fallback to original vmap version if needed
+            from .jax_jax_opt import calc_energy_forces_stress as jax_calc
+            calc_func = jax_calc
+        
+        energies, forces, stress = calc_func(
             self,
-            itypes,
-            all_js,
-            all_rijs,
-            all_jtypes,
+            itypes,         # Already (n_atoms,)
+            all_js,         # Already (n_atoms, n_neighbors)
+            all_rijs,       # Already (n_atoms, n_neighbors, 3) 
+            all_jtypes,     # Already (n_atoms, n_neighbors)
             cell_rank,
             volume,
             mtp_data.species,
@@ -63,10 +73,10 @@ class JaxMTPEngine(EngineBase):
             self.moment_basis.pair_contractions,
             self.moment_basis.scalar_contractions,
         )
+        
         results = {}
         results["energies"] = energies
         results["energy"] = results["energies"].sum()
         results["forces"] = forces
         results["stress"] = stress
         return results
-    

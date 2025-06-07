@@ -21,9 +21,8 @@ def make_mtp_engine(engine: str = "numpy") -> EngineBase:
 
         return JaxMTPEngine
     elif engine == "jax_new":
-        #from motep.motep_jax.jax_engine_stuff.engine_jax import JaxMTPEngine
         from .jax_engine.engine_jax import JaxMTPEngine
-        
+        #from .jax_engine.engine_jax_batch import JaxMTPEngine
         return JaxMTPEngine
     else:
         raise ValueError(engine)
