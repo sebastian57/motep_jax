@@ -8,20 +8,19 @@ from jax import lax
 import numpy.typing as npt
 from ase import Atoms
 import math
+from typing import Dict, List, Tuple, Any
+import dataclasses
 
 jax.config.update("jax_enable_x64", False)
 
+@dataclasses.dataclass
 class ContractionNode:
-    def __init__(self, key, kind):
-        self.key = key
-        self.kind = kind       
-        self.left = None        
-        self.right = None       
-        self.axes = None       
-        self.result = None     
-
-    def __repr__(self):
-        return f"<Node {self.key} ({self.kind})>"
+    key: Any
+    kind: str
+    left: 'ContractionNode' = None
+    right: 'ContractionNode' = None
+    axes: Tuple = None
+    result: Any = None
 
 def get_types(atoms: Atoms, species: list[int] = None) -> npt.NDArray[np.int64]:
     if species is None:
@@ -188,7 +187,7 @@ def _jax_calc_local_energy(
         * smoothing
         * jnp.einsum("jmn, jn -> mj", radial_coeffs[itype, jtypes], radial_basis)
     )
-    basis = _jax_calc_basis(
+    basis = _jax_calc_basis_flattened(
         r_ijs, r_abs, rb_values, basic_moments, pair_contractions, scalar_contractions
     )
     energy = species_coeffs[itype] + jnp.dot(moment_coeffs, basis)
@@ -208,87 +207,73 @@ def _jax_chebyshev_basis(r, number_of_terms, min_dist, max_dist):
 
 @partial(jax.vmap, in_axes=[0, None], out_axes=0)
 def _jax_make_tensor(r, nu):
-    m = 1
-    for _ in range(nu):
+    if nu == 0:
+        return jnp.array(1.0)
+    
+    m = r
+    for _ in range(nu - 1):
         m = jnp.tensordot(r, m, axes=0)
-        
     return m
 
-#@partial(jax.jit, static_argnums=(2,))
 def _jax_contract_over_axes(m1, m2, axes):
-    #jax.debug.print('axes: {}', axes)
-    calculated_contraction = jnp.tensordot(m1, m2, axes=axes)
-    return calculated_contraction
+    return jnp.tensordot(m1, m2, axes=axes)
 
-
-def _create_roots(basic_moments, pair_contractions, scalar_contractions):
+def _create_contraction_tree(basic_moments, pair_contractions, scalar_contractions):
     nodes = {}
-
+    
     for moment_key in basic_moments:
         nodes[moment_key] = ContractionNode(key=moment_key, kind='basic')
-
+    
     for contraction_key in pair_contractions:
         nodes[contraction_key] = ContractionNode(key=contraction_key, kind='contract')
-
+    
     for contraction_key in pair_contractions:
-        node = nodes[contraction_key]           
+        node = nodes[contraction_key]
         key_left, key_right, _, (axes_left, axes_right) = contraction_key
-
-        node.left = nodes[key_left]             
-        node.right = nodes[key_right]           
-        node.axes = (axes_left, axes_right)     
-
-    root_keys = set()
-    for S in scalar_contractions:
-        root_keys.add(S)
-
-    root_nodes = [nodes[k] for k in root_keys]
-
+        
+        node.left = nodes[key_left]
+        node.right = nodes[key_right]
+        node.axes = (axes_left, axes_right)
+    
+    root_nodes = [nodes[k] for k in scalar_contractions]
+    
     return nodes, root_nodes
 
-def _clear_all_results(nodes_dict):
-    for node in nodes_dict.values():
-        node.result = None
-
-def _evaluate_node(node, r, rb_values):
-    if node.result is not None:
-        return node.result
-
+def _evaluate_node_optimized(node, r, rb_values, memo_dict):
+    node_id = id(node)
+    if node_id in memo_dict:
+        return memo_dict[node_id]
+    
     if node.kind == 'basic':
         mu, nu, _ = node.key
-
+        
         full_tensor = _jax_make_tensor(r, nu)
-
-        small_tensor = (full_tensor.T * rb_values[mu]).sum(axis=-1)
-
-        node.result = small_tensor
-        return small_tensor
-
-    if node.kind == 'contract':
-        left_val = _evaluate_node(node.left, r, rb_values)
-        right_val = _evaluate_node(node.right, r, rb_values)
-
+        result = (full_tensor.T * rb_values[mu]).sum(axis=-1)
+        
+    elif node.kind == 'contract':
+        left_val = _evaluate_node_optimized(node.left, r, rb_values, memo_dict)
+        right_val = _evaluate_node_optimized(node.right, r, rb_values, memo_dict)
+        
         axes_left, axes_right = node.axes
+        result = _jax_contract_over_axes(left_val, right_val, (axes_left, axes_right))
+        
+    else:
+        raise ValueError(f"Unknown node.kind = {node.kind!r} for key = {node.key!r}")
+    
+    memo_dict[node_id] = result
+    return result
 
-        out = _jax_contract_over_axes(left_val, right_val, (axes_left, axes_right))
-
-        node.result = out
-        return out
-
-    raise ValueError(f"Unknown node.kind = {node.kind!r} for key = {node.key!r}")
-
-def _compute_basis_for_atom(r, rb_values, nodes_dict, root_nodes):
-   
-    #_clear_all_results(nodes_dict)
-
+def _compute_basis_optimized(r, rb_values, root_nodes):
+    memo_dict = {} 
+    
     basis_vals = []
     for root in root_nodes:
-        scalar_val = _evaluate_node(root, r, rb_values)
+        scalar_val = _evaluate_node_optimized(root, r, rb_values, memo_dict)
         basis_vals.append(scalar_val)
-    return jnp.stack(basis_vals) 
+    
+    return jnp.stack(basis_vals)
 
-#@partial(jax.jit, static_argnums=(3, 4, 5))
-def _jax_calc_basis(
+def _jax_calc_basis_optimized(
     r_ijs,
     r_abs,
     rb_values,
@@ -299,11 +284,63 @@ def _jax_calc_basis(
 ):
     r = (r_ijs.T / r_abs).T
 
-    nodes, root_nodes = _create_roots(basic_moments, pair_contractions, scalar_contractions)
-
-    basis = _compute_basis_for_atom(r, rb_values, nodes, root_nodes)
+    nodes, root_nodes = _create_contraction_tree(basic_moments, pair_contractions, scalar_contractions)
+    basis = _compute_basis_optimized(r, rb_values, root_nodes)
     
     return basis
 
+def _flatten_computation_graph(basic_moments, pair_contractions, scalar_contractions):
+    execution_order = []
+    dependencies = {}
+    
+    for moment_key in basic_moments:
+        execution_order.append(('basic', moment_key))
+        dependencies[moment_key] = []
+    
+    remaining_contractions = list(pair_contractions)
+    while remaining_contractions:
+        for i, contraction_key in enumerate(remaining_contractions):
+            key_left, key_right, _, axes = contraction_key
+            if key_left in dependencies and key_right in dependencies:
+                execution_order.append(('contract', contraction_key))
+                dependencies[contraction_key] = [key_left, key_right]
+                remaining_contractions.pop(i)
+                break
+        else:
+            raise ValueError("Circular dependency in contraction graph")
+    
+    return execution_order, dependencies
+
+def _jax_calc_basis_flattened(
+    r_ijs,
+    r_abs,
+    rb_values,
+    # Static parameters:
+    basic_moments,
+    pair_contractions,
+    scalar_contractions,
+):
+    r = (r_ijs.T / r_abs).T
+    
+    execution_order, dependencies = _flatten_computation_graph(
+        basic_moments, pair_contractions, scalar_contractions
+    )
+    
+    results = {}
+    
+    for op_type, key in execution_order:
+        if op_type == 'basic':
+            mu, nu, _ = key
+            full_tensor = _jax_make_tensor(r, nu)
+            results[key] = (full_tensor.T * rb_values[mu]).sum(axis=-1)
+            
+        elif op_type == 'contract':
+            key_left, key_right, _, (axes_left, axes_right) = key
+            left_val = results[key_left]
+            right_val = results[key_right]
+            results[key] = _jax_contract_over_axes(left_val, right_val, (axes_left, axes_right))
+    
+    basis_vals = [results[k] for k in scalar_contractions]
+    return jnp.stack(basis_vals)
 
 
