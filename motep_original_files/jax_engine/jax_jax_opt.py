@@ -205,21 +205,17 @@ class ContractionNode:
     axes: Tuple = None
     result: Any = None
 
-# Generate all unique symmetric indices for a given tensor rank
 def _generate_symmetric_indices(nu):
-    """Generate unique symmetric tensor indices and their multiplicities."""
     if nu == 0:
         return [((), 1)]
     
     indices = []
     multiplicities = []
     
-    # Generate all possible combinations where i+j+k = nu and i,j,k >= 0
     for i in range(nu + 1):
         for j in range(nu + 1 - i):
             k = nu - i - j
             if k >= 0:
-                # Compute multiplicity: nu! / (i! * j! * k!)
                 from math import factorial
                 mult = factorial(nu) // (factorial(i) * factorial(j) * factorial(k))
                 indices.append((i, j, k))
@@ -227,59 +223,30 @@ def _generate_symmetric_indices(nu):
     
     return list(zip(indices, multiplicities))
 
-# Fused symmetric tensor computation
 def _compute_symmetric_weighted_sum(r, rb_values_mu, nu):
-    """
-    Compute the weighted sum of symmetric tensor elements directly.
-    
-    Args:
-        r: neighbor vectors (n_neighbors, 3)
-        rb_values_mu: radial basis values for specific mu (n_neighbors,)
-        nu: tensor rank
-    
-    Returns:
-        Weighted symmetric tensor (3, 3, ..., 3) with nu dimensions
-    """
     if nu == 0:
         return rb_values_mu.sum()
     
     n_neighbors = r.shape[0]
     
-    # Get unique symmetric indices and their multiplicities
     sym_indices_mults = _generate_symmetric_indices(nu)
     
-    # Initialize result tensor
     result_shape = (3,) * nu
     result = jnp.zeros(result_shape)
     
-    # For each unique symmetric pattern
     for (i, j, k), multiplicity in sym_indices_mults:
         if i + j + k != nu:
             continue
-            
-        # Compute the contribution from this symmetric pattern
-        # This is equivalent to r[:, 0]^i * r[:, 1]^j * r[:, 2]^k weighted by rb_values
         contribution = (r[:, 0]**i * r[:, 1]**j * r[:, 2]**k * rb_values_mu).sum()
         
-        # Fill all symmetric positions with this contribution
-        # For efficiency, we'll use a different approach that directly computes the tensor
-        
-    # Alternative: Direct computation without explicit enumeration
-    # This is more efficient for JAX compilation
     return _fused_tensor_sum(r, rb_values_mu, nu)
 
 def _fused_tensor_sum(r, rb_values_mu, nu):
-    """
-    Fused computation that directly computes sum(r_outer_product^nu * rb_values).
-    This avoids creating the full tensor and leverages JAX's optimization.
-    """
     if nu == 0:
         return rb_values_mu.sum()
     elif nu == 1:
-        # Direct computation: sum over neighbors of r * rb_values
         return jnp.einsum('ni,n->i', r, rb_values_mu)
     elif nu == 2:
-        # sum over neighbors of r_i * r_j * rb_values
         return jnp.einsum('ni,nj,n->ij', r, r, rb_values_mu)
     elif nu == 3:
         return jnp.einsum('ni,nj,nk,n->ijk', r, r, r, rb_values_mu)
@@ -288,14 +255,35 @@ def _fused_tensor_sum(r, rb_values_mu, nu):
     elif nu == 5:
         return jnp.einsum('ni,nj,nk,nl,nm,n->ijklm', r, r, r, r, r, rb_values_mu)
     elif nu == 6:
-        return jnp.einsum('ni,nj,nk,nl,nm,no,n->ijklmo', r, r, r, r, r, r, rb_values_mu)
+        return jnp.einsum('ni,nj,nk,nl,nm,no,n->ijklmn', r, r, r, r, r, r, rb_values_mu)
+    elif nu == 7:
+        return jnp.einsum('ni,nj,nk,nl,nm,no,np,n->ijklmno', r, r, r, r, r, r, r, rb_values_mu)
+    elif nu == 8:
+        return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,n->ijklmnop', r, r, r, r, r, r, r, r, rb_values_mu)
+    elif nu == 9:
+        return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,n->ijklmnopq', r, r, r, r, r, r, r, r, r, rb_values_mu)
+    elif nu == 10:
+        return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,n->ijklmnopqr', r, r, r, r, r, r, r, r, r, r, rb_values_mu)
+    elif nu == 11:
+        return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,n->ijklmnopqrs', r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
+    elif nu == 12:
+        return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,n->ijklmnopqrst', r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
+    elif nu == 13:
+        return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,n->ijklmnopqrstu', r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
+    elif nu == 14:
+        return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,nw,n->ijklmnopqrstuv', r, r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
+    elif nu == 15:
+        return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,nw,nx,n->ijklmnopqrstuvw', r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
+    elif nu == 16:
+        return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,nw,nx,ny,n->ijklmnopqrstuvwx', r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
+    elif nu == 17:
+        return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,nw,nx,ny,nz,n->ijklmnopqrstuvwxy', r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
+    elif nu == 18:
+        return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,nw,nx,ny,nz,na,n->ijklmnopqrstuvwxya', r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
     else:
-        # Fallback for higher orders (less optimal but general)
         return _general_tensor_sum(r, rb_values_mu, nu)
 
 def _general_tensor_sum(r, rb_values_mu, nu):
-    """General fallback for arbitrary tensor ranks."""
-    # Start with the weighted sum
     result = rb_values_mu[0] * _outer_product_recursive(r[0], nu)
     
     for i in range(1, r.shape[0]):
@@ -304,7 +292,6 @@ def _general_tensor_sum(r, rb_values_mu, nu):
     return result
 
 def _outer_product_recursive(vec, nu):
-    """Compute outer product of vector with itself nu times."""
     if nu == 0:
         return jnp.array(1.0)
     elif nu == 1:
@@ -315,14 +302,10 @@ def _outer_product_recursive(vec, nu):
             m = jnp.tensordot(vec, m, axes=0)
         return m
 
-# Optimized contraction function
 def _jax_contract_over_axes(m1, m2, axes):
-    """Tensor contraction optimized for symmetric tensors."""
     return jnp.tensordot(m1, m2, axes=axes)
 
-# Graph structure functions (unchanged but optimized)
 def _flatten_computation_graph(basic_moments, pair_contractions, scalar_contractions):
-    """Pre-compute execution order for optimal graph traversal."""
     execution_order = []
     dependencies = {}
     
@@ -345,41 +328,6 @@ def _flatten_computation_graph(basic_moments, pair_contractions, scalar_contract
     return execution_order, dependencies
 
 
-# Performance comparison and memory usage analysis
-def analyze_optimization_impact():
-    """
-    Analysis of the optimization impact:
-    
-    Memory Savings:
-    - nu=3: Eliminates 27-element tensor storage, direct computation
-    - nu=4: Eliminates 81-element tensor storage 
-    - nu=5: Eliminates 243-element tensor storage
-    - nu=6: Eliminates 729-element tensor storage
-    
-    Speed Improvements:
-    1. Eliminates tensor transpose operation (.T)
-    2. Fuses multiplication and summation into single einsum
-    3. Reduces memory bandwidth requirements
-    4. Better cache locality for ROCm GPU
-    
-    Expected speedup: 2-5x for tensor creation phase
-    Memory reduction: Up to 90% for high-nu tensors
-    """
-    print("Symmetric + Fused Tensor Optimization")
-    print("=====================================")
-    print("Key improvements:")
-    print("1. Fused tensor creation + weighting + summation")
-    print("2. Eliminated transpose operations")
-    print("3. Direct einsum computation")
-    print("4. Reduced memory allocations")
-    print("5. Better GPU memory access patterns")
-    
-    # Memory comparison
-    for nu in range(1, 7):
-        original_elements = 3**nu
-        print(f"nu={nu}: Eliminates {original_elements}-element tensor storage")
-
-
 def _jax_calc_basis_symmetric_fused(
     r_ijs,
     r_abs,
@@ -389,33 +337,18 @@ def _jax_calc_basis_symmetric_fused(
     pair_contractions,
     scalar_contractions,
 ):
-    """
-    Optimized basis computation with symmetric tensor exploitation and operator fusion.
-    
-    Key optimizations:
-    1. Fused tensor creation + radial weighting + summation
-    2. Symmetric tensor awareness (doesn't store full tensors)
-    3. Efficient einsum operations for each tensor rank
-    4. Optimized memory access patterns
-    """
-    # Normalize r vectors (same as before)
     r = (r_ijs.T / r_abs).T
     
-    # Get execution order
     execution_order, dependencies = _flatten_computation_graph(
         basic_moments, pair_contractions, scalar_contractions
     )
     
-    # Results dictionary for intermediate values
     results = {}
     
-    # Execute computation graph
     for op_type, key in execution_order:
         if op_type == 'basic':
             mu, nu, _ = key
             
-            # FUSED OPERATION: This replaces the separate tensor creation, 
-            # transpose, multiplication, and summation with a single fused operation
             results[key] = _fused_tensor_sum(r, rb_values[mu], nu)
             
         elif op_type == 'contract':
@@ -424,7 +357,6 @@ def _jax_calc_basis_symmetric_fused(
             right_val = results[key_right]
             results[key] = _jax_contract_over_axes(left_val, right_val, (axes_left, axes_right))
     
-    # Collect final results
     basis_vals = [results[k] for k in scalar_contractions]
     return jnp.stack(basis_vals)
 
