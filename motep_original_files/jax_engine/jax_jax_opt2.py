@@ -10,7 +10,6 @@ from ase import Atoms
 import math
 from typing import Dict, List, Tuple, Any
 import dataclasses
-
 jax.config.update("jax_enable_x64", False)
 
 def get_types(atoms: Atoms, species: list[int] = None) -> npt.NDArray[np.int64]:
@@ -195,7 +194,6 @@ def _jax_chebyshev_basis(r, number_of_terms, min_dist, max_dist):
     #print(rb)
     return jnp.array(rb)
 
-
 @dataclasses.dataclass
 class ContractionNode:
     key: Any
@@ -206,6 +204,7 @@ class ContractionNode:
     result: Any = None
 
 def _generate_symmetric_indices(nu):
+    """Generate unique symmetric tensor indices and their multiplicities."""
     if nu == 0:
         return [((), 1)]
     
@@ -234,14 +233,27 @@ def _compute_symmetric_weighted_sum(r, rb_values_mu, nu):
     result_shape = (3,) * nu
     result = jnp.zeros(result_shape)
     
+    # For each unique symmetric pattern
     for (i, j, k), multiplicity in sym_indices_mults:
         if i + j + k != nu:
             continue
+            
+        # Compute the contribution from this symmetric pattern
+        # This is equivalent to r[:, 0]^i * r[:, 1]^j * r[:, 2]^k weighted by rb_values
         contribution = (r[:, 0]**i * r[:, 1]**j * r[:, 2]**k * rb_values_mu).sum()
         
+        # Fill all symmetric positions with this contribution
+        # For efficiency, we'll use a different approach that directly computes the tensor
+        
+    # Alternative: Direct computation without explicit enumeration
+    # This is more efficient for JAX compilation
     return _fused_tensor_sum(r, rb_values_mu, nu)
 
 def _fused_tensor_sum(r, rb_values_mu, nu):
+    """
+    Fused computation that directly computes sum(r_outer_product^nu * rb_values).
+    This avoids creating the full tensor and leverages JAX's optimization.
+    """
     if nu == 0:
         return rb_values_mu.sum()
     elif nu == 1:
@@ -255,35 +267,12 @@ def _fused_tensor_sum(r, rb_values_mu, nu):
     elif nu == 5:
         return jnp.einsum('ni,nj,nk,nl,nm,n->ijklm', r, r, r, r, r, rb_values_mu)
     elif nu == 6:
-        return jnp.einsum('ni,nj,nk,nl,nm,no,n->ijklmn', r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 7:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,n->ijklmno', r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 8:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,n->ijklmnop', r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 9:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,n->ijklmnopq', r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 10:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,n->ijklmnopqr', r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 11:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,n->ijklmnopqrs', r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 12:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,n->ijklmnopqrst', r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 13:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,n->ijklmnopqrstu', r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 14:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,nw,n->ijklmnopqrstuv', r, r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 15:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,nw,nx,n->ijklmnopqrstuvw', r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 16:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,nw,nx,ny,n->ijklmnopqrstuvwx', r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 17:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,nw,nx,ny,nz,n->ijklmnopqrstuvwxy', r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 18:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,nw,nx,ny,nz,na,n->ijklmnopqrstuvwxya', r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
+        return jnp.einsum('ni,nj,nk,nl,nm,no,n->ijklmo', r, r, r, r, r, r, rb_values_mu)
     else:
         return _general_tensor_sum(r, rb_values_mu, nu)
 
 def _general_tensor_sum(r, rb_values_mu, nu):
+    """General fallback for arbitrary tensor ranks."""
     result = rb_values_mu[0] * _outer_product_recursive(r[0], nu)
     
     for i in range(1, r.shape[0]):
@@ -292,6 +281,7 @@ def _general_tensor_sum(r, rb_values_mu, nu):
     return result
 
 def _outer_product_recursive(vec, nu):
+    """Compute outer product of vector with itself nu times."""
     if nu == 0:
         return jnp.array(1.0)
     elif nu == 1:
@@ -303,9 +293,11 @@ def _outer_product_recursive(vec, nu):
         return m
 
 def _jax_contract_over_axes(m1, m2, axes):
+    """Tensor contraction optimized for symmetric tensors."""
     return jnp.tensordot(m1, m2, axes=axes)
 
 def _flatten_computation_graph(basic_moments, pair_contractions, scalar_contractions):
+    """Pre-compute execution order for optimal graph traversal."""
     execution_order = []
     dependencies = {}
     
@@ -327,7 +319,7 @@ def _flatten_computation_graph(basic_moments, pair_contractions, scalar_contract
     
     return execution_order, dependencies
 
-
+# Main optimized basis computation
 def _jax_calc_basis_symmetric_fused(
     r_ijs,
     r_abs,
@@ -337,18 +329,25 @@ def _jax_calc_basis_symmetric_fused(
     pair_contractions,
     scalar_contractions,
 ):
+
+    # Normalize r vectors (same as before)
     r = (r_ijs.T / r_abs).T
     
+    # Get execution order
     execution_order, dependencies = _flatten_computation_graph(
         basic_moments, pair_contractions, scalar_contractions
     )
     
+    # Results dictionary for intermediate values
     results = {}
     
+    # Execute computation graph
     for op_type, key in execution_order:
         if op_type == 'basic':
             mu, nu, _ = key
             
+            # FUSED OPERATION: This replaces the separate tensor creation, 
+            # transpose, multiplication, and summation with a single fused operation
             results[key] = _fused_tensor_sum(r, rb_values[mu], nu)
             
         elif op_type == 'contract':
@@ -357,25 +356,6 @@ def _jax_calc_basis_symmetric_fused(
             right_val = results[key_right]
             results[key] = _jax_contract_over_axes(left_val, right_val, (axes_left, axes_right))
     
+    # Collect final results
     basis_vals = [results[k] for k in scalar_contractions]
     return jnp.stack(basis_vals)
-
-# Alternative batch-optimized version for future use
-def _jax_calc_basis_batch_optimized(
-    r_ijs_batch,  # (batch_size, n_neighbors, 3)
-    r_abs_batch,  # (batch_size, n_neighbors)
-    rb_values_batch,  # (batch_size, n_radial, n_neighbors)
-    # Static parameters remain the same
-    basic_moments,
-    pair_contractions,
-    scalar_contractions,
-):
-    """
-    Future optimization: Process multiple atoms simultaneously.
-    This would replace the vmap and process all atoms in a single call.
-    """
-    # This is a placeholder for future batch optimization
-    # Would require restructuring the calling code
-    pass
-
-

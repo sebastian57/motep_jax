@@ -239,55 +239,37 @@ def _compute_symmetric_weighted_sum(r, rb_values_mu, nu):
             continue
         contribution = (r[:, 0]**i * r[:, 1]**j * r[:, 2]**k * rb_values_mu).sum()
         
-    return _fused_tensor_sum(r, rb_values_mu, nu)
+    return _safe_tensor_sum(r, rb_values_mu, nu)
 
-def _fused_tensor_sum(r, rb_values_mu, nu):
+
+
+def _safe_tensor_sum(r, rb_values_mu, nu):
     if nu == 0:
         return rb_values_mu.sum()
-    elif nu == 1:
+    if nu == 1:
         return jnp.einsum('ni,n->i', r, rb_values_mu)
     elif nu == 2:
         return jnp.einsum('ni,nj,n->ij', r, r, rb_values_mu)
     elif nu == 3:
         return jnp.einsum('ni,nj,nk,n->ijk', r, r, r, rb_values_mu)
-    elif nu == 4:
-        return jnp.einsum('ni,nj,nk,nl,n->ijkl', r, r, r, r, rb_values_mu)
-    elif nu == 5:
-        return jnp.einsum('ni,nj,nk,nl,nm,n->ijklm', r, r, r, r, r, rb_values_mu)
-    elif nu == 6:
-        return jnp.einsum('ni,nj,nk,nl,nm,no,n->ijklmn', r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 7:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,n->ijklmno', r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 8:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,n->ijklmnop', r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 9:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,n->ijklmnopq', r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 10:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,n->ijklmnopqr', r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 11:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,n->ijklmnopqrs', r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 12:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,n->ijklmnopqrst', r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 13:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,n->ijklmnopqrstu', r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 14:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,nw,n->ijklmnopqrstuv', r, r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 15:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,nw,nx,n->ijklmnopqrstuvw', r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 16:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,nw,nx,ny,n->ijklmnopqrstuvwx', r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 17:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,nw,nx,ny,nz,n->ijklmnopqrstuvwxy', r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    #elif nu == 18:
-    #    return jnp.einsum('ni,nj,nk,nl,nm,no,np,nq,nr,ns,nt,nu,nv,nw,nx,ny,nz,na,n->ijklmnopqrstuvwxya', r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, r, rb_values_mu)
-    else:
-        return _general_tensor_sum(r, rb_values_mu, nu)
+    return _iterative_tensor_sum(r, rb_values_mu, nu)
 
-def _general_tensor_sum(r, rb_values_mu, nu):
-    result = rb_values_mu[0] * _outer_product_recursive(r[0], nu)
+def _iterative_tensor_sum(r, rb_values_mu, nu):
+    result = rb_values_mu[0] * _vector_outer_product(r[0], nu)
     
     for i in range(1, r.shape[0]):
-        result += rb_values_mu[i] * _outer_product_recursive(r[i], nu)
+        result += rb_values_mu[i] * _vector_outer_product(r[i], nu)
+    
+    return result
+
+def _vector_outer_product(vec, nu):
+    if nu == 0:
+        return jnp.array(1.0)
+    
+    result = vec
+    
+    for _ in range(1, nu):
+        result = jnp.expand_dims(result, axis=0) * jnp.expand_dims(vec, axis=tuple(range(1, result.ndim + 1)))
     
     return result
 
@@ -349,7 +331,7 @@ def _jax_calc_basis_symmetric_fused(
         if op_type == 'basic':
             mu, nu, _ = key
             
-            results[key] = _fused_tensor_sum(r, rb_values[mu], nu)
+            results[key] = _safe_tensor_sum(r, rb_values[mu], nu)
             
         elif op_type == 'contract':
             key_left, key_right, _, (axes_left, axes_right) = key
