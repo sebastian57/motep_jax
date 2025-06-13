@@ -100,8 +100,8 @@ def main():
             
             params = epoch_carry['params']
             #write_mtp_file(level,species,params,file)
-            with open('mtp_params', 'wb') as f:
-                pickle.dump(params, f)
+            #with open('mtp_params', 'wb') as f:
+            #    pickle.dump(params, f)
         elif args.train5 == 'true':
             epoch_carry, epoch_losses, steps_performed, loss_history, val_loss_history = train5(args.training_cfg, level, args.batch_size, args.steps1, args.threshold_loss, 
                                                                                                 args.min_steps, args.lr_start, args.transition_steps, args.decay_rate, 
