@@ -4,9 +4,9 @@ set -e
 PYTHON_EXE="python3" 
 SCRIPT_PATH="./motep_jax_analysis.py" 
 
-FOLDER_NAME="train4_contree_batch_cpu" 
-RUN_NAME="train4_contree_batch_cpu"
-OUTPUT_NAME="train4_contree_batch_cpu_report"
+FOLDER_NAME="train4_contree_deep_cpu" 
+RUN_NAME="train4_contree_deep_cpu"
+OUTPUT_NAME="train4_contree_deep_cpu_report"
 THRESHOLD_LOSS=3.2241e-06
 MIN_STEPS=10
 LR_START=3e-1
