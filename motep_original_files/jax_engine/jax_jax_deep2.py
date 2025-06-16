@@ -36,14 +36,12 @@ def calc_energy_forces_stress(
     species_coeffs,
     moment_coeffs,
     radial_coeffs,
-    # Static parameters:
     basic_moments,
     pair_contractions,
     scalar_contractions,
 ):
     
-
-    local_energies, local_gradient = _jax_calc_local_energy_and_derivs(
+    local_energies, forces = _jax_calc_local_energy_and_derivs(
         all_rijs,
         itypes,
         all_jtypes,
@@ -53,53 +51,35 @@ def calc_energy_forces_stress(
         scaling,
         min_dist,
         max_dist,
+        itypes.shape,
+        len(itypes),
         # Static parameters:
         radial_coeffs.shape[3],
         basic_moments,
         pair_contractions,
         scalar_contractions,
     )
-
-    # changed from np. to jnp.
-    forces = jnp.array(local_gradient.sum(axis=1))
-    forces = jnp.subtract.at(forces, all_js, local_gradient, inplace=False)
-    #jnp.subtract.at(forces, all_js, local_gradient)
-
-    # fix this later. Must be possible with just the information itself
-    stress = jnp.array((all_rijs.transpose((0, 2, 1)) @ local_gradient).sum(axis=0))
     
+    stress = jnp.array((all_rijs.transpose((0, 2, 1)) @ forces).sum(axis=0))
     
-    # does not work because of if condition
-    ###############################################
-    # ijk @ ikj -> ikk -> kk
-    #if cell_rank == 3:
-    #    stress = (stress + stress.T) * 0.5  # symmetrize
-    #    stress /= volume
-    #    # new
-    #    indices = jnp.array([0, 4, 8, 5, 2, 1])
-    #    stress = stress.reshape(-1)[indices]
-    #    #stress = stress.flat[[0, 4, 8, 5, 2, 1]] # was stress.flat[[...]]
-    #else:
-    #    stress = jnp.full(6, np.nan)
-    # works well enough 
-    ##############################################  
     def compute_stress_true(stress, volume):
-        stress_sym = (stress + stress.T) * 0.5  # symmetrize
-        stress_sym = stress_sym / volume
+        stress_sym = (stress + stress.T) * 0.5 / volume
         indices = jnp.array([0, 4, 8, 5, 2, 1])
         return stress_sym.reshape(-1)[indices]
 
     def compute_stress_false(_):
-        return jnp.full(6, np.nan)
+        return jnp.full(6, jnp.nan)
     
-    stress = lax.cond(jnp.equal(cell_rank, 3),
-                lambda _: compute_stress_true(stress, volume),
-                lambda _: compute_stress_false(stress),
-                operand=None)
-    return local_energies, forces, stress
+    stress_voigt = lax.cond(
+        jnp.equal(cell_rank, 3),
+        lambda _: compute_stress_true(stress, volume),
+        lambda _: compute_stress_false(stress),
+        operand=None
+    )
+    
+    return local_energies, forces, stress_voigt
 
-#@partial(jax.jit, static_argnums=(9, 10, 11, 12))
-@partial(jax.vmap, in_axes=(0,) * 3 + (None,) * 10, out_axes=0)
+@partial(jax.vmap, in_axes=(0,) * 3 + (None,) * 12, out_axes=0)
 def _jax_calc_local_energy_and_derivs(
     r_ijs,
     itype,
@@ -110,45 +90,38 @@ def _jax_calc_local_energy_and_derivs(
     scaling,
     min_dist,
     max_dist,
+    itypes_shape,
+    itypes_len,
     # Static parameters:
     rb_size,
     basic_moments,
     pair_contractions,
     scalar_contractions,
 ):
-    energy = _jax_calc_local_energy(
-        r_ijs,
-        itype,
-        jtypes,
-        species_coeffs,
-        moment_coeffs,
-        radial_coeffs,
-        scaling,
-        min_dist,
-        max_dist,
-        # Static parameters:
-        rb_size,
-        basic_moments,
-        pair_contractions,
-        scalar_contractions,
-    )
-    derivs = jax.jacobian(_jax_calc_local_energy)(
-        r_ijs,
-        itype,
-        jtypes,
-        species_coeffs,
-        moment_coeffs,
-        radial_coeffs,
-        scaling,
-        min_dist,
-        max_dist,
-        # Static parameters:
-        rb_size,
-        basic_moments,
-        pair_contractions,
-        scalar_contractions,
-    )
-    return energy, derivs
+    
+    def energy_fn(r_ijs):
+        return _jax_calc_local_energy(
+            r_ijs,
+            itype,
+            jtypes,
+            species_coeffs,
+            moment_coeffs,
+            radial_coeffs,
+            scaling,
+            min_dist,
+            max_dist,
+            # Static parameters:
+            rb_size,
+            basic_moments,
+            pair_contractions,
+            scalar_contractions,
+        ).sum()  
+
+    total_energy, forces = jax.value_and_grad(energy_fn)(r_ijs)
+
+    local_energies = jnp.full(itypes_shape, total_energy / itypes_len)
+    
+    return local_energies, forces
 
 @partial(jax.jit, static_argnums=(9, 10, 11, 12))
 def _jax_calc_local_energy(
@@ -182,16 +155,17 @@ def _jax_calc_local_energy(
     energy = species_coeffs[itype] + jnp.dot(moment_coeffs, basis)
     return energy
 
-
-#@partial(jax.jit, static_argnums=[1, 2, 3])
-@partial(jax.vmap, in_axes=[0, None, None, None], out_axes=0)
-def _jax_chebyshev_basis(r, number_of_terms, min_dist, max_dist):
+def _jax_chebyshev_basis(r, n_terms, min_dist, max_dist):
     r_scaled = (2 * r - (min_dist + max_dist)) / (max_dist - min_dist)
-    rb = [1, r_scaled]
-    for i in range(2, number_of_terms):
-        rb.append(2 * r_scaled * rb[i - 1] - rb[i - 2])
-    #print(rb)
-    return jnp.array(rb)
+    # Precompute T0 and T1 for all r
+    T = jnp.zeros((n_terms, r.shape[0]))
+    T = T.at[0].set(1.0)
+    if n_terms > 1:
+        T = T.at[1].set(r_scaled)
+    # Vectorized recurrence for n>=2
+    for i in range(2, n_terms):
+        T = T.at[i].set(2 * r_scaled * T[i-1] - T[i-2])
+    return T.T
 
 
 @dataclasses.dataclass
@@ -239,31 +213,10 @@ def _compute_symmetric_weighted_sum(r, rb_values_mu, nu):
         
     return _safe_tensor_sum(r, rb_values_mu, nu)
 
-
-def _safe_tensor_sum_(r, rb_values_mu, nu):
-    if nu == 0:
-        return rb_values_mu.sum()
-    if nu == 1:
-        return jnp.einsum('ni,n->i', r, rb_values_mu)
-    elif nu == 2:
-        return jnp.einsum('ni,nj,n->ij', r, r, rb_values_mu)
-    elif nu == 3:
-        return jnp.einsum('ni,nj,nk,n->ijk', r, r, r, rb_values_mu)
-    return _iterative_tensor_sum(r, rb_values_mu, nu)
-
-def _iterative_tensor_sum(r, rb_values_mu, nu):
-    result = rb_values_mu[0] * _vector_outer_product(r[0], nu)
-    
-    for i in range(1, r.shape[0]):
-        result += rb_values_mu[i] * _vector_outer_product(r[i], nu)
-    
-    return result
-
 def _safe_tensor_sum(r, rb_values_mu, nu):
     if nu == 0:
         return rb_values_mu.sum()
     
-    # Use fused einsum with explicit output layout
     einsum_str = {
         1: "ni,n->i",
         2: "ni,nj,n->ij",
@@ -275,13 +228,11 @@ def _safe_tensor_sum(r, rb_values_mu, nu):
                           optimize='optimal', 
                           preferred_element_type=jnp.float32)
     
-    # Fallback for higher ranks
     return jnp.tensordot(
         reduce(jnp.multiply, [r] * nu),
         rb_values_mu,
         axes=([0], [0])
     )
-
 
 def _vector_outer_product(vec, nu):
     if nu == 0:
@@ -362,3 +313,4 @@ def _jax_calc_basis_symmetric_fused(
     
     basis_vals = [results[k] for k in scalar_contractions]
     return jnp.stack(basis_vals)
+
