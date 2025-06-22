@@ -633,8 +633,8 @@ def train4(training_cfg, level, steps_lbfgs, threshold_loss, min_steps, lr_start
     # something wrong here
     images_total = read_images([f'training_data/{training_cfg}'], species=species)    
     data_split = int(3/4*len(images_total))
-    images = images_total[0:data_split]#[0:5]
-    images_val = images_total[1-data_split:]#[0:1]
+    images = images_total[0:data_split][0:5]
+    images_val = images_total[1-data_split:][0:1]
     
     
     rng = np.random.default_rng(10)

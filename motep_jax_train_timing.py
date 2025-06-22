@@ -9,12 +9,14 @@ import tracemalloc
 from jax.experimental.compilation_cache import compilation_cache as cc
 #from jax.experimental import device_memory_profiler as dmp
 import jax.profiler as profiler
+import os
 
 import jax
 jax.config.update('jax_enable_x64', False)
 
 cc.reset_cache()
 
+#os.environ['JAX_PLATFORM_NAME'] = 'cpu'
 
 def main():
     parser = argparse.ArgumentParser(description="Run MTP Jax training timing test.")
