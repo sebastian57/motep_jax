@@ -1,3 +1,6 @@
+import os
+os.environ['XLA_FLAGS'] = '--xla_gpu_autotune_level=0'
+
 from functools import partial, reduce
 
 import jax
@@ -23,7 +26,6 @@ def get_types(atoms: Atoms, species: list[int] = None) -> npt.NDArray[np.int64]:
         return np.fromiter((species.index(_) for _ in atoms.numbers), dtype=int)
 
 
-# @partial(jax.jit, static_argnums=(9, 10, 11, 12))
 def calc_energy_forces_stress(
     engine,
     itypes,
@@ -63,12 +65,14 @@ def calc_energy_forces_stress(
         scalar_contractions,
     )
     
+        
     stress = jnp.array((all_rijs.transpose((0, 2, 1)) @ forces).sum(axis=0))
     
     def compute_stress_true(stress, volume):
         stress_sym = (stress + stress.T) * 0.5 / volume
         indices = jnp.array([0, 4, 8, 5, 2, 1])
         return stress_sym.reshape(-1)[indices]
+
 
     def compute_stress_false(_):
         return jnp.full(6, jnp.nan)
@@ -80,11 +84,12 @@ def calc_energy_forces_stress(
         operand=None
     )
 
-    forces = jnp.squeeze(forces, axis=1)
+    forces = jnp.sum(forces, axis=-2)
     
     return local_energies, forces, stress_voigt
 
 @partial(jax.vmap, in_axes=(0,) * 3 + (None,) * 12, out_axes=0)
+@partial(jax.jit, static_argnums=(9,10,11,12,13,14))
 def _jax_calc_local_energy_and_derivs(
     r_ijs,
     itype,
@@ -104,6 +109,13 @@ def _jax_calc_local_energy_and_derivs(
     scalar_contractions,
 ):
     
+        
+    execution_order, _ = _flatten_computation_graph(
+        basic_moments, pair_contractions, scalar_contractions
+    )
+    
+    execution_order = tuple(execution_order)
+    
     def energy_fn(r_ijs):
         return _jax_calc_local_energy(
             r_ijs,
@@ -117,22 +129,18 @@ def _jax_calc_local_energy_and_derivs(
             max_dist,
             # Static parameters:
             rb_size,
-            basic_moments,
-            pair_contractions,
+            execution_order,
             scalar_contractions,
         ).sum()  
 
     total_energy, forces = jax.value_and_grad(energy_fn)(r_ijs)
-    
-    #forces = jnp.squeeze(forces, axis=0)
-    #print(forces.shape)
-    #jax.debug.print("forces shape: {}", forces.shape)
      
     local_energies = jnp.full(itypes_shape, total_energy / itypes_len)
     
     return local_energies, forces
 
-@partial(jax.jit, static_argnums=(9, 10, 11, 12))
+
+@partial(jax.jit, static_argnums=(9, 10, 11))
 def _jax_calc_local_energy(
     r_ijs,
     itype,
@@ -145,150 +153,103 @@ def _jax_calc_local_energy(
     max_dist,
     # Static parameters:
     rb_size,
-    basic_moments,
-    pair_contractions,
-    scalar_contractions,
+    execution_order,
+    scalar_contractions
 ):
     r_abs = jnp.linalg.norm(r_ijs, axis=1)
-    smoothing = jnp.where(r_abs < max_dist, (max_dist - r_abs) ** 2, 0)
-    radial_basis = _jax_chebyshev_basis(r_abs, rb_size, min_dist, max_dist) 
+    #smoothing = jnp.where(r_abs < max_dist, (max_dist - r_abs) ** 2, 0)
+    #radial_basis = _jax_chebyshev_basis(r_abs, rb_size, min_dist, max_dist) 
     # j, rb_size
-    rb_values = (
-        scaling
-        * smoothing
-        * jnp.einsum("jmn, jn -> mj", radial_coeffs[itype, jtypes], radial_basis)
-    )
+    #rb_values = (
+    #    scaling
+    #    * smoothing
+    #    * jnp.einsum("jmn, jn -> mj", radial_coeffs[itype, jtypes], radial_basis)
+    #)
+    
+    radial_basis = _jax_chebyshev_basis(r_abs, rb_size, min_dist, max_dist)
+    smoothing = jnp.where(r_abs < max_dist, (max_dist - r_abs) ** 2, 0)
+    scaled_smoothing = scaling * smoothing
+    
+    coeffs = radial_coeffs[itype, jtypes]  
+    contracted = jnp.sum(coeffs * radial_basis[:, None, :], axis=-1) 
+    rb_values = scaled_smoothing[:, None] * contracted  
+    rb_values = rb_values.T  
+
+    
     basis = _jax_calc_basis_symmetric_fused(
-        r_ijs, r_abs, rb_values, basic_moments, pair_contractions, scalar_contractions
+        r_ijs, r_abs, rb_values, execution_order, scalar_contractions
     )
     energy = species_coeffs[itype] + jnp.dot(moment_coeffs, basis)
     return energy
 
+
+
 def _jax_chebyshev_basis(r, n_terms, min_dist, max_dist):
     r_scaled = (2 * r - (min_dist + max_dist)) / (max_dist - min_dist)
-    # Precompute T0 and T1 for all r
     T = jnp.zeros((n_terms, r.shape[0]))
     T = T.at[0].set(1.0)
     if n_terms > 1:
         T = T.at[1].set(r_scaled)
-    # Vectorized recurrence for n>=2
     for i in range(2, n_terms):
         T = T.at[i].set(2 * r_scaled * T[i-1] - T[i-2])
     return T.T
-
-
-@dataclasses.dataclass
-class ContractionNode:
-    key: Any
-    kind: str
-    left: 'ContractionNode' = None
-    right: 'ContractionNode' = None
-    axes: Tuple = None
-    result: Any = None
-
-def _generate_symmetric_indices(nu):
+    
+    
+def _compute_tensor_chunk(rb, r, nu):
+    """Compute tensor sum for a chunk of neighbors."""
     if nu == 0:
-        return [((), 1)]
-    
-    indices = []
-    multiplicities = []
-    
-    for i in range(nu + 1):
-        for j in range(nu + 1 - i):
-            k = nu - i - j
-            if k >= 0:
-                from math import factorial
-                mult = factorial(nu) // (factorial(i) * factorial(j) * factorial(k))
-                indices.append((i, j, k))
-                multiplicities.append(mult)
-    
-    return list(zip(indices, multiplicities))
-
-def _compute_symmetric_weighted_sum(r, rb_values_mu, nu):
-    if nu == 0:
-        return rb_values_mu.sum()
-    
-    n_neighbors = r.shape[0]
-    
-    sym_indices_mults = _generate_symmetric_indices(nu)
-    
-    result_shape = (3,) * nu
-    result = jnp.zeros(result_shape)
-    
-    for (i, j, k), multiplicity in sym_indices_mults:
-        if i + j + k != nu:
-            continue
-        contribution = (r[:, 0]**i * r[:, 1]**j * r[:, 2]**k * rb_values_mu).sum()
-        
-    return _safe_tensor_sum(r, rb_values_mu, nu)
+        return jnp.sum(rb)
+    elif nu == 1:
+        return jnp.sum(rb[:, None] * r, axis=0)
+    elif nu == 2:
+        return jnp.einsum('i,ij,ik->jk', rb, r, r)
+    elif nu == 3:
+        return jnp.einsum('i,ij,ik,il->jkl', rb, r, r, r)
+    else:
+        operands = [rb] + [r] * nu
+        letters = string.ascii_lowercase[:nu]
+        input_subs = ['i'] + [f'i{l}' for l in letters]
+        output_str = ''.join(letters)
+        input_str = ','.join(input_subs)
+        return jnp.einsum(f'{input_str}->{output_str}', *operands)
 
 def _safe_tensor_sum_(r, rb_values_mu, nu):
-    if nu == 0:
-        return rb_values_mu.sum()
-    einsum_str = {
-        1: "ni,n->i",
-        2: "ni,nj,n->ij",
-        3: "ni,nj,nk,n->ijk"
-    }.get(nu, None)
+    CHUNK_SIZE = 1000
+    n = r.shape[0]
+    if nu <= 3 or n <= CHUNK_SIZE:
+        return _compute_tensor_chunk(rb_values_mu, r, nu)
     
-    if einsum_str:
-        return jnp.einsum(einsum_str, r, r, rb_values_mu, 
-                          optimize='optimal', 
-                          preferred_element_type=jnp.float32)
+   
+    n_chunks = (n + CHUNK_SIZE - 1) // CHUNK_SIZE
+    init_val = jnp.zeros((3,) * nu) if nu > 0 else 0.0
+
+    def body(i, carry):
+        start = i * CHUNK_SIZE
+        chunk_r = r[start:start + CHUNK_SIZE]
+        chunk_rb = rb_values_mu[start:start + CHUNK_SIZE]
+        chunk_val = _compute_tensor_chunk(chunk_rb, chunk_r, nu)
+        return carry + chunk_val
+
+    return lax.fori_loop(0, n_chunks, body, init_val)
     
-    return jnp.tensordot(
-        reduce(jnp.multiply, [r] * nu),
-        rb_values_mu,
-        axes=([0], [0])
-    )
-
-
+    
 def _safe_tensor_sum(r, rb_values_mu, nu):
     if nu == 0:
-        return rb_values_mu.sum()
-
-    letters = list(string.ascii_lowercase)
-    if nu <= len(letters):
-        dims = letters[:nu] 
-        in_sub = [f"n{d}" for d in dims] + ["n"]
-        out_sub = "".join(dims)
-        eq = ",".join(in_sub) + "->" + out_sub
-
-        args = [r] * nu + [rb_values_mu]
-        return jnp.einsum(
-            eq, *args,
-            optimize="optimal",
-            preferred_element_type=jnp.float32
-        )
-
-    return jnp.tensordot(
-        reduce(operator.mul, [r] * nu),
-        rb_values_mu,
-        axes=([0], [0])
-    )
-
-
-def _vector_outer_product(vec, nu):
-    if nu == 0:
-        return jnp.array(1.0)
-    
-    result = vec
-    
-    for _ in range(1, nu):
-        result = jnp.expand_dims(result, axis=0) * jnp.expand_dims(vec, axis=tuple(range(1, result.ndim + 1)))
-    
-    return result
-
-def _outer_product_recursive(vec, nu):
-    if nu == 0:
-        return jnp.array(1.0)
+        return jnp.sum(rb_values_mu)
     elif nu == 1:
-        return vec
+        return jnp.dot(rb_values_mu, r)  
+    elif nu == 2:
+        return jnp.einsum('i,ij,ik->jk', rb_values_mu, r, r)  
+    elif nu == 3:
+        return jnp.einsum('i,ij,ik,il->jkl', rb_values_mu, r, r, r)  
     else:
-        m = vec
-        for _ in range(nu - 1):
-            m = jnp.tensordot(vec, m, axes=0)
-        return m
+        operands = [rb_values_mu] + [r] * nu
+        letters = string.ascii_lowercase[:nu]
+        input_subs = ['i'] + [f'i{l}' for l in letters]
+        return jnp.einsum(
+            f'{",".join(input_subs)}->{"".join(letters)}', 
+            *operands
+        )
 
 def _jax_contract_over_axes(m1, m2, axes):
     return jnp.tensordot(m1, m2, axes=axes)
@@ -321,15 +282,12 @@ def _jax_calc_basis_symmetric_fused(
     r_abs,
     rb_values,
     # Static parameters:
-    basic_moments,
-    pair_contractions,
-    scalar_contractions,
+    execution_order,
+    scalar_contractions
+
 ):
     r = (r_ijs.T / r_abs).T
-    
-    execution_order, dependencies = _flatten_computation_graph(
-        basic_moments, pair_contractions, scalar_contractions
-    )
+
     
     results = {}
     
