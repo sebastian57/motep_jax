@@ -38,7 +38,7 @@ def train(training_cfg, level, steps_opt1, steps_opt2, species=None, pkl_file='j
     jax_images = load_data_pickle(f'{pkl_file}.pkl')
     
     # do I need to pass this as static args??
-    prediction_fn = mtp_instance.calculate_jax_new
+    prediction_fn = mtp_instance.calculate_jax
     num_basis_params = mtp_data.moment_coeffs.shape[0]
     
     
@@ -110,7 +110,7 @@ def train(training_cfg, level, steps_opt1, steps_opt2, species=None, pkl_file='j
         def loss_epoch(params, atoms_ids):
             def predict(atoms_id):
                 itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, E, F, sigma = get_data_for_indices(jax_images, atoms_id)
-                targets = mtp_instance.calculate_jax_new(
+                targets = mtp_instance.calculate_jax(
                     itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, params
                 )
                 return targets, [E, F, sigma]
@@ -238,7 +238,7 @@ def train_2_lss_lbfgs(training_cfg, level, steps_opt1, species=None, pkl_file='j
     extract_and_save_img_data(images, species, mtp_data)
     jax_images = load_data_pickle(f'{pkl_file}.pkl')
     
-    prediction_fn = mtp_instance.calculate_jax_new
+    prediction_fn = mtp_instance.calculate_jax
     num_basis_params = mtp_data.moment_coeffs.shape[0]
     n_atoms_representative = 2
     num_f_components_per_config = 3 * n_atoms_representative
@@ -298,7 +298,7 @@ def train_2_lss_lbfgs(training_cfg, level, steps_opt1, species=None, pkl_file='j
         def loss_epoch(params, atoms_ids):
             def predict(atoms_id):
                 itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, E, F, sigma = get_data_for_indices(jax_images, atoms_id)
-                targets = mtp_instance.calculate_jax_new(
+                targets = mtp_instance.calculate_jax(
                     itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, params
                 )
                 return targets, [E, F, sigma]
@@ -387,7 +387,7 @@ def train3(training_cfg, level, steps_opt1, steps_opt2, species=None, pkl_file='
     jax_images = load_data_pickle(f'{pkl_file}.pkl')
     
     # do I need to pass this as static args??
-    prediction_fn = mtp_instance.calculate_jax_new
+    prediction_fn = mtp_instance.calculate_jax
     num_basis_params = mtp_data.moment_coeffs.shape[0]
     
     
@@ -459,7 +459,7 @@ def train3(training_cfg, level, steps_opt1, steps_opt2, species=None, pkl_file='
         def loss_epoch(params, atoms_ids):
             def predict(atoms_id):
                 itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, E, F, sigma = get_data_for_indices(jax_images, atoms_id)
-                targets = mtp_instance.calculate_jax_new(
+                targets = mtp_instance.calculate_jax(
                     itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, params
                 )
                 return targets, [E, F, sigma]
@@ -666,7 +666,7 @@ def train4(training_cfg, level, steps_lbfgs, threshold_loss, min_steps, lr_start
     #print(len(jax_images['E']))
     #print(len(jax_val_images['E']))
     
-    prediction_fn = mtp_instance.calculate_jax_new
+    prediction_fn = mtp_instance.calculate_jax
     num_basis_params = mtp_data.moment_coeffs.shape[0]
     n_atoms_representative = int(jax_images['n_atoms'][0])
     num_f_components_per_config = 3 * n_atoms_representative
@@ -703,7 +703,7 @@ def train4(training_cfg, level, steps_lbfgs, threshold_loss, min_steps, lr_start
                 #jax.debug.print("rijs: {}", all_rijs.shape)
                 #jax.debug.print("jtypes: {}", all_jtypes.shape)
 
-                targets = mtp_instance.calculate_jax_new(
+                targets = mtp_instance.calculate_jax(
                     itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, params
                 )
                 return targets, [E, F, sigma]
@@ -713,7 +713,7 @@ def train4(training_cfg, level, steps_lbfgs, threshold_loss, min_steps, lr_start
         def loss_epoch_val(params, atoms_ids):
             def predict(atoms_id):
                 itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, E, F, sigma = get_data_for_indices(jax_val_images, atoms_id)
-                targets = mtp_instance.calculate_jax_new(
+                targets = mtp_instance.calculate_jax(
                     itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, params
                 )
                 return targets, [E, F, sigma]
@@ -900,7 +900,7 @@ def train5(training_cfg, level, batch_size, steps_lbfgs, threshold_loss, min_ste
     print(len(jax_images['E']))
     print(len(jax_val_images['E']))
     
-    prediction_fn = mtp_instance.calculate_jax_new
+    prediction_fn = mtp_instance.calculate_jax
     num_basis_params = mtp_data.moment_coeffs.shape[0]
     n_atoms_representative = int(jax_images['n_atoms'][0])
     num_f_components_per_config = 3 * n_atoms_representative
@@ -927,7 +927,7 @@ def train5(training_cfg, level, batch_size, steps_lbfgs, threshold_loss, min_ste
         def loss_batch(params, atoms_ids):
             def predict(atoms_id):
                 itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, E, F, sigma = get_data_for_indices(jax_images, atoms_id)
-                targets = mtp_instance.calculate_jax_new(
+                targets = mtp_instance.calculate_jax(
                     itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, params
                 )
                 return targets, [E, F, sigma]
@@ -937,7 +937,7 @@ def train5(training_cfg, level, batch_size, steps_lbfgs, threshold_loss, min_ste
         def loss_epoch_val(params, atoms_ids):
             def predict(atoms_id):
                 itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, E, F, sigma = get_data_for_indices(jax_val_images, atoms_id)
-                targets = mtp_instance.calculate_jax_new(
+                targets = mtp_instance.calculate_jax(
                     itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, params
                 )
                 return targets, [E, F, sigma]
@@ -969,11 +969,11 @@ def train5(training_cfg, level, batch_size, steps_lbfgs, threshold_loss, min_ste
             def scan_body(carry_scan, x_batch_indices):
                 acc_grads, acc_loss_sum = carry_scan
                 batch_loss_sum, batch_grads = loss_and_grads(params, x_batch_indices)
-                new_acc_grads = jax.tree_map(lambda acc, batch: acc + batch, acc_grads, batch_grads)
+                new_acc_grads = jax.tree.map(lambda acc, batch: acc + batch, acc_grads, batch_grads)
                 new_acc_loss_sum = acc_loss_sum + batch_loss_sum
                 return (new_acc_grads, new_acc_loss_sum), None
         
-            zero_grads = jax.tree_map(jnp.zeros_like, params)
+            zero_grads = jax.tree.map(jnp.zeros_like, params)
             init_carry_scan = (zero_grads, 0.0)
         
             final_carry_scan, _ = lax.scan(scan_body, init_carry_scan, batched_indices)
@@ -981,7 +981,7 @@ def train5(training_cfg, level, batch_size, steps_lbfgs, threshold_loss, min_ste
             total_grads_accumulated, total_loss_sum_accumulated = final_carry_scan
         
             avg_loss = total_loss_sum_accumulated / jnp.maximum(num_samples, 1)
-            avg_grads = jax.tree_map(lambda g: g / jnp.maximum(num_samples, 1), total_grads_accumulated)
+            avg_grads = jax.tree.map(lambda g: g / jnp.maximum(num_samples, 1), total_grads_accumulated)
         
             clipped_avg_grads, _ = optax.clip_by_global_norm(global_norm_clip).update(avg_grads, opt_state, params)
         
@@ -1206,7 +1206,7 @@ def mtp(cfgs,level,params,min_dist=0.5,max_dist=5.0,scaling=1.0,species=None):
         atoms_ids = jnp.arange(0,len(jax_images))
         def predict(atoms_id):
             itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, E, F, sigma = get_data_for_indices(jax_images, atoms_id)
-            targets = mtp_instance.calculate_jax_new(
+            targets = mtp_instance.calculate_jax(
                 itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, params
             )
             return targets, [E,F,sigma]
