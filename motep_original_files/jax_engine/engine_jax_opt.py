@@ -4,7 +4,7 @@ from ..base import EngineBase
 from ..data import MTPData
 
 from .conversion import BasisConverter, moments_count_to_level_map
-from .jax_jax_deep3 import calc_energy_forces_stress as jax_calc
+from .jax_jax_deep5 import calc_energy_forces_stress as jax_calc
 from .moment_jax import MomentBasis
 
 import jax
@@ -19,8 +19,28 @@ class JaxMTPEngine(EngineBase):
         self.basis_converter = None
         super().__init__(*args, **kwargs)
 
-        #with jax.profiler.trace("/path/to/log"):
-        #    forces, stress = jax_calc(...)
+
+    def _flatten_computation_graph(self, basic_moments, pair_contractions, scalar_contractions):
+        execution_order = []
+        dependencies = {}
+        
+        for moment_key in basic_moments:
+            execution_order.append(('basic', moment_key))
+            dependencies[moment_key] = []
+        
+        remaining_contractions = list(pair_contractions)
+        while remaining_contractions:
+            for i, contraction_key in enumerate(remaining_contractions):
+                key_left, key_right, _, axes = contraction_key
+                if key_left in dependencies and key_right in dependencies:
+                    execution_order.append(('contract', contraction_key))
+                    dependencies[contraction_key] = [key_left, key_right]
+                    remaining_contractions.pop(i)
+                    break
+            else:
+                raise ValueError("Circular dependency in contraction graph")
+        
+        return execution_order, dependencies
 
     def update(self, mtp_data: MTPData) -> None:
         """Update MTP parameters."""
@@ -37,7 +57,16 @@ class JaxMTPEngine(EngineBase):
                     "Use a new instance instead."
                 )
             self.basis_converter.remap_mlip_moment_coeffs(self.mtp_data)
-    
+
+            basic_moments = self.moment_basis.basic_moments
+            scalar_contractions = self.moment_basis.scalar_contractions
+            pair_contractions = self.moment_basis.pair_contractions
+            
+
+            execution_order, _ = self._flatten_computation_graph(
+                basic_moments, pair_contractions, scalar_contractions
+            )            
+            self.moment_basis.execution_order = tuple(execution_order)
 
 
     def calculate(self, itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, params):
@@ -50,7 +79,6 @@ class JaxMTPEngine(EngineBase):
         self.basis_converter.remapped_coeffs = params['basis']
 
         energies, forces, stress = jax_calc(
-            self,
             itypes,
             all_js,
             all_rijs,
@@ -65,9 +93,8 @@ class JaxMTPEngine(EngineBase):
             self.basis_converter.remapped_coeffs,
             mtp_data.radial_coeffs,
             # Static parameters:
-            self.moment_basis.basic_moments,
-            self.moment_basis.pair_contractions,
-            self.moment_basis.scalar_contractions,
+            self.moment_basis.execution_order,
+            tuple(self.moment_basis.scalar_contractions)
         )
         results = {}
         results["energies"] = energies
@@ -75,5 +102,4 @@ class JaxMTPEngine(EngineBase):
         results["forces"] = forces
         results["stress"] = stress
         return results
-
-
+    
