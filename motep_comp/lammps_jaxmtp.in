@@ -4,57 +4,55 @@ dimension       3
 boundary        p p s
 atom_style      atomic
 
-read_data       bulk_ni3al_smaller.data
-
+read_data       bulk_ni3al_small.data
+replicate 1 1 1
 # ---------- Define Interatomic Potential ---------------------
-pair_style jax/mtp_direct jax_potential_exported_padded.bin 5.0
+pair_style jax/mtp_direct jax_potential.bin 5.0
 pair_coeff * *
 
 neighbor 1.5 bin  
 neigh_modify every 1 delay 5 check yes  
 
-#mass 2 26.98
-#mass 1 58.69
-
-mass 1 26.98
-mass 2 58.69
+mass 1 26.98  # Al
+mass 2 58.69  # Ni
 
 ######################################
 # Variable
 variable        temperature     equal   300      # Kelvin
 
 # ------------------------- SETTINGS ---------------------------------
+# Define computes for dumping
+compute csym all centro/atom fcc
+compute peratom all pe/atom
 
-# REMOVED GPU ACCELERATION - NOT NEEDED FOR CPU
-# package gpu 1 ngpu 4
-
-#fix            1 all npt temp ${temperature} ${temperature} 0.1 x 0 0 1 y 0 0 1
+minimize 1.0e-4 1.0e-6 100 1000
+reset_timestep 0
 
 fix 1 all nvt temp ${temperature} ${temperature} 0.1
 
-thermo         200
-thermo_style   custom vol pxx pyy pzz pe ke etotal 
+thermo         50
+thermo_style   custom step temp vol pxx pyy pzz pe ke etotal
 
-#dump            myequil all cfg 5000 dump.equil1_*.cfg mass type xs ys zs c_csym c_peratom fx fy fz
-#dump_modify     myequil element Al Ni
+timestep 0.0005
 
-timestep 0.00001
-run 3
+# ------------------------- DUMP STATEMENTS ---------------------------------
+# Option 1: Basic XYZ dump (most compatible)
+dump xyz_dump all xyz 50 trajectory.dump
 
-#write_data     equil.data
-#write_restart  equil.restart
+# Option 2: Custom dump with forces and energy
+dump custom_dump all custom 50 trajectory.lammpstrj id type x y z fx fy fz c_peratom
+dump_modify custom_dump element Al Ni
 
-######################################
-# SIMULATION DONE
-print                           "All Done!"
+# Option 3: CFG dump with all properties (original style, but corrected)
+dump cfg_dump all cfg 100 dump.equil_*.cfg mass type xs ys zs c_csym c_peratom fx fy fz
+dump_modify cfg_dump element Al Ni
 
-# CPU execution command (replace the GPU-specific command):
-# mpirun -n 4 lmp -in in.lammps
-# OR for OpenMP threading:
-# export OMP_NUM_THREADS=8
-# mpirun -n 4 lmp -in in.lammps
-# 
-# Environment variables for optimal CPU performance:
-# export XLA_FLAGS="--xla_cpu_multi_thread_eigen=true"
-# export XLA_PYTHON_CLIENT_PREALLOCATE=false
-# export JAX_DISABLE_JIT=0
+# Choose one of the above - comment out the others
+# Recommended: use xyz_dump for simplicity or custom_dump for detailed analysis
+
+run 5000
+
+# Clean output
+print "All Done!"
+print "Trajectory written to trajectory.xyz"
+print "Custom trajectory written to trajectory.lammpstrj"

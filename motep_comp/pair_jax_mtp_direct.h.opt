@@ -20,8 +20,8 @@ namespace LAMMPS_NS {
 class PairJaxMTPDirect : public Pair {
  public:
   // Constants for padding - must match JAX compilation
-  static const int MAX_ATOMS = 64;
-  static const int MAX_NEIGHBORS = 64;
+  static const int MAX_ATOMS = 20000;
+  static const int MAX_NEIGHBORS = 300;
   
   PairJaxMTPDirect(class LAMMPS *);
   ~PairJaxMTPDirect() override;

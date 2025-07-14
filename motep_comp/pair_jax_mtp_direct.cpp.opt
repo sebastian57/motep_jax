@@ -40,7 +40,7 @@ PairJaxMTPDirect::PairJaxMTPDirect(LAMMPS *lmp) : Pair(lmp)
   
   jax_function_path = nullptr;
   cutoff = 0.0;
-  max_neighbors = 64;
+  max_neighbors = 300;
   
   jax_export_module = nullptr;
   jax_function = nullptr;
@@ -108,8 +108,8 @@ void PairJaxMTPDirect::compute(int eflag, int vflag)
 
   if (inum == 0) return;
 
-  const int MAX_ATOMS = 64;
-  const int MAX_NEIGHBORS = 64;
+  const int MAX_ATOMS = 20000;
+  const int MAX_NEIGHBORS = 300;
   const double SAFE_DISTANCE = cutoff + 2.0;
 
   int natoms_actual = std::min(inum, MAX_ATOMS);

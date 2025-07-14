@@ -120,8 +120,8 @@ def extract_static_params(level, mtp_file, MAX_ATOMS, MAX_NEIGHBORS):
 
     return compile_args, mtp_data, jax_calc_wrapper
 
-MAX_ATOMS = 64
-MAX_NEIGHBORS = 64
+MAX_ATOMS = 20000
+MAX_NEIGHBORS = 300
 # Extract static parameters and get wrapper function
 compile_args, mtp_data, jax_calc_wrapper = extract_static_params(12, 'Ni3Al-12g', MAX_ATOMS, MAX_NEIGHBORS)
 
@@ -134,7 +134,7 @@ lowered_with_static = jitted_calc.trace(*compile_args).lower()
 
 # Save StableHLO MLIR
 stablehlo_text = lowered_with_static.compiler_ir(dialect="stablehlo")
-with open("jax_potential_padded.stablehlo.mlir", "w") as f:
+with open("jax_potential.stablehlo.mlir", "w") as f:
     f.write(str(stablehlo_text))
 
 print(lowered_with_static.as_text())
@@ -163,10 +163,10 @@ try:
     serialized_data = exported_calc.serialize()
     
     # Save serialized data to file
-    with open("jax_potential_exported_padded.bin", "wb") as f:
+    with open("jax_potential.bin", "wb") as f:
         f.write(serialized_data)
     
-    print(f"Serialized data saved to jax_potential_exported_padded.bin ({len(serialized_data)} bytes)")
+    print(f"Serialized data saved to jax_potential.bin ({len(serialized_data)} bytes)")
 
 
     def test_distance_filtering():
@@ -202,23 +202,6 @@ try:
     
     test_distance_filtering()
     
-    # Test that the exported function works
-    print("\n=== Testing Exported Function ===")
-    atom_id = 0
-    calc_args_test = _get_data(atom_id, MAX_ATOMS, MAX_NEIGHBORS)
-    
-    start_time = time.time()
-    exported_result = exported_calc.call(*calc_args_test)
-    end_time = time.time()
-    exported_time = end_time - start_time
-    
-    print(exported_result[0])
-    print(exported_result[1])
-    print(exported_result[-1])
-
-    print(f"Exported function time: {exported_time:.6f} seconds")
-    print(f"Result shapes: {[np.array(r).shape for r in exported_result]}")
-    
     export_success = True
     
 except Exception as e:
@@ -229,10 +212,10 @@ except Exception as e:
 
 print("\n=== Summary ===")
 print("Files created:")
-print("1. jax_potential_padded.stablehlo.mlir - StableHLO from lowering")
+print("1. jax_potential.stablehlo.mlir - StableHLO from lowering")
 if export_success:
-    print("2. jax_potential_exported_padded.bin - Serialized padded function")
+    print("2. jax_potential.bin - Serialized padded function")
     print(f"\nFunction expects exactly 8 inputs (no more static argument issues)")
-    print(f"Supports up to {64} atoms with {32} neighbors each")
+    print(f"Supports up to {MAX_ATOMS} atoms with {MAX_NEIGHBORS} neighbors each")
 else:
     print("2. Export failed - check errors above")
