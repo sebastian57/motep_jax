@@ -1,0 +1,64 @@
+# CPU 
+PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+PYTHON_INCLUDE=$(python3 -c "import sysconfig; print(sysconfig.get_path('include'))")
+PYTHON_LIB=$(python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
+NUMPY_INCLUDE=$(python3 -c "import numpy; print(numpy.get_include())")
+
+cmake ../cmake \
+  -D CMAKE_BUILD_TYPE=Release \
+  -D BUILD_MPI=ON \
+  -D BUILD_SHARED_LIBS=OFF \
+  -D BUILD_LIB=ON \
+  \
+  -D PKG_EXTRA-PAIR=ON \
+  -D PKG_KSPACE=ON \
+  -D PKG_PYTHON=ON \
+  -D PKG_MOLECULE=ON \
+  -D PKG_MANYBODY=ON \
+  \
+  -D PYTHON_EXECUTABLE=$(which python3) \
+  -D PYTHON_INCLUDE_DIR="$PYTHON_INCLUDE" \
+  -D PYTHON_LIBRARY="$PYTHON_LIB_DIR/libpython${PYTHON_VERSION}.so" \
+  -D Python3_EXECUTABLE=$(which python3) \
+  -D Python3_INCLUDE_DIR="$PYTHON_INCLUDE" \
+  -D Python3_LIBRARY="$PYTHON_LIB_DIR/libpython${PYTHON_VERSION}.so" \
+  -D Python3_NumPy_INCLUDE_DIR="$NUMPY_INCLUDE" \
+  \
+  -D CMAKE_CXX_FLAGS="-I$PYTHON_INCLUDE -I$NUMPY_INCLUDE"
+
+make -j$(nproc)
+
+
+# GPU
+PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+PYTHON_INCLUDE=$(python3 -c "import sysconfig; print(sysconfig.get_path('include'))")
+PYTHON_LIB=$(python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
+NUMPY_INCLUDE=$(python3 -c "import numpy; print(numpy.get_include())")
+
+cmake ../cmake \
+  -D CMAKE_BUILD_TYPE=Release \
+  -D CMAKE_INSTALL_PREFIX=~/jax_lammps_env \
+  -D BUILD_MPI=ON \
+  -D BUILD_SHARED_LIBS=ON \
+  -D BUILD_LIB=ON \
+  \
+  -D PKG_GPU=ON \
+  -D GPU_ARCH=gfx942 \
+  -D GPU_PREC=mixed \
+  \
+  -D PKG_EXTRA-PAIR=ON \
+  -D PKG_KSPACE=ON \
+  -D PKG_PYTHON=ON \
+  -D PKG_MOLECULE=ON \
+  -D PKG_MANYBODY=ON \
+  \
+  -D PYTHON_EXECUTABLE=$(which python3) \
+  -D PYTHON_INCLUDE_DIR="$PYTHON_INCLUDE" \
+  -D PYTHON_LIBRARY="$PYTHON_LIB_DIR/libpython${PYTHON_VERSION}.so" \
+  -D Python3_EXECUTABLE=$(which python3) \
+  -D Python3_INCLUDE_DIR="$PYTHON_INCLUDE" \
+  -D Python3_LIBRARY="$PYTHON_LIB_DIR/libpython${PYTHON_VERSION}.so" \
+  -D Python3_NumPy_INCLUDE_DIR="$NUMPY_INCLUDE" 
+
+make -j$(nproc)
+
