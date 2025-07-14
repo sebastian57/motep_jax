@@ -48,6 +48,16 @@ class OptimizedMTPLammpsInterface:
             )
             return targets
 
+    @partial(jax.jit, static_argnums=(0,1))
+    def _get_data(self, atom_id):
+        return get_data_for_indices(self.jax_val_images, atom_id)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _calculate_targets(self, itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, E, F, sigma):
+        return self.mtp_instance.calculate_jax(
+            itypes, all_js, all_rijs, all_jtypes, cell_rank, volume, self.params
+        )
+
 def main():
 
     parser = argparse.ArgumentParser(description="Run MTP Jax calc timing.")
@@ -57,27 +67,44 @@ def main():
     
     mtp_interface = OptimizedMTPLammpsInterface(
         'training_data/Ni3Al-12g.mtp', 
-        'val_jax_images_data_subset'
+        'val_jax_images_data'
     )
 
     elapsed_times = []
     for i in range(0, args.atom_ids):
-        start_time = time.time()
-        targets = mtp_interface._calculate_mtp(i)
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        elapsed_times.append(elapsed_time)
+        #start_time = time.time()
+        #targets = mtp_interface._calculate_mtp(i)
+        #end_time = time.time()
+        #elapsed_time = end_time - start_time
+        #elapsed_times.append(elapsed_time)
+
+        _ = mtp_interface._get_data(i)
+        _ = mtp_interface._calculate_targets(*_)
+
+        start = time.perf_counter()
+        data = mtp_interface._get_data(i)
+        jax.block_until_ready(data)
+        t1 = time.perf_counter()
+
+        for dat in data:
+            print(dat.shape)
+
+        start2 = time.perf_counter()
+        targets = mtp_interface._calculate_targets(*data)
+        jax.block_until_ready(targets)
+        t2 = time.perf_counter()
+
+        print(f"Data prep: {t1 - start:.6f} s")
+        print(f"Target calc: {t2 - start2:.6f} s")
 
     
     elapsed_times = np.array(elapsed_times)
 
-    print(f'Compilation time: {elapsed_times[0]}')
-    print(f'Mean time after compilation: {np.mean(elapsed_times[1::])}')
-    print(f'Total time: {np.sum(elapsed_times)}')
+    #print(f'Compilation time: {elapsed_times[0]}')
+    #print(f'Mean time after compilation: {np.mean(elapsed_times[1::])}')
+    #print(f'Total time: {np.sum(elapsed_times)}')
 
 
 if __name__ == "__main__":
     main()
-
-
 
