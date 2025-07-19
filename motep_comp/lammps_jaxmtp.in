@@ -7,6 +7,8 @@ atom_style      atomic
 read_data       bulk_ni3al_small.data
 replicate 1 1 1
 # ---------- Define Interatomic Potential ---------------------
+
+# Need to be careful which potential file is used (cpu or gpu)
 pair_style jax/mtp_direct jax_potential.bin 5.0
 pair_coeff * *
 
