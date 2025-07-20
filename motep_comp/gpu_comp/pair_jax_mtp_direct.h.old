@@ -1,6 +1,6 @@
 /* -*- c++ -*- ----------------------------------------------------------
    LAMMPS - Large-scale Atomic/Molecular Massively Parallel Simulator
-   Direct JAX Implementation - Dynamic Array Sizing
+   Direct JAX Implementation - No Python Module Overhead
 ------------------------------------------------------------------------- */
 
 #ifdef PAIR_CLASS
@@ -19,6 +19,10 @@ namespace LAMMPS_NS {
 
 class PairJaxMTPDirect : public Pair {
  public:
+  // Constants for padding - must match JAX compilation
+  static const int MAX_ATOMS = 64;
+  static const int MAX_NEIGHBORS = 64;
+  
   PairJaxMTPDirect(class LAMMPS *);
   ~PairJaxMTPDirect() override;
   void compute(int, int) override;
@@ -29,9 +33,8 @@ class PairJaxMTPDirect : public Pair {
 
  private:
   char *jax_function_path;     // Path to JAX exported function (.bin file)
-  double cutoff;               // Cutoff distance (extracted from JAX potential)
-  int max_atoms;               // Maximum atoms per computation (runtime argument)
-  int max_neighbors;           // Maximum neighbors per atom (runtime argument)
+  double cutoff;               // Cutoff distance
+  int max_neighbors;           // Maximum neighbors per atom
   
   // Direct JAX objects (NO Python module!)
   PyObject *jax_export_module;   // jax.export module
@@ -68,14 +71,14 @@ class PairJaxMTPDirect : public Pair {
   
   void allocate();
   
-  // NumPy helper functions
+  // REUSED: NumPy helper functions (same as before)
   PyObject *create_numpy_array_int32(int *data, int dim1);
   PyObject *create_numpy_array_int32_2d(int **data, int dim1, int dim2);
   PyObject *create_numpy_array_float32_3d(double ***data, int dim1, int dim2, int dim3);
   void extract_numpy_array_float32_2d(PyObject *array, double **data, int dim1, int dim2);
   void extract_numpy_array_float32_1d(PyObject *array, double *data, int dim1);
   
-  // Memory view helpers (avoid copying)
+  // NEW: Memory view helpers (avoid copying)
   void update_numpy_array_int32(PyObject *array, int *data, int size);
   void update_numpy_array_int32_2d(PyObject *array, int **data, int dim1, int dim2);
   void update_numpy_array_float32_3d(PyObject *array, double ***data, int dim1, int dim2, int dim3);

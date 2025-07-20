@@ -9,7 +9,8 @@ replicate 1 1 1
 # ---------- Define Interatomic Potential ---------------------
 
 # Need to be careful which potential file is used (cpu or gpu)
-pair_style jax/mtp_direct jax_potential.bin 5.0
+# The arguments are MAX_ATOMS and MAX_NEIGHBORS (need to match with whatever the .bin file was compiled!)
+pair_style jax/mtp_direct jax_potential_gpu.bin 6500 200
 pair_coeff * *
 
 neighbor 1.5 bin  
