@@ -649,9 +649,6 @@ def train4(training_cfg, level, steps_lbfgs, threshold_loss, min_steps, lr_start
     mtp_data.max_dist = max_dist
     mtp_data.scaling = scaling
     mtp_data.initialize(rng)
-    
-    #print(mtp_data)    
-    
 
     
     mtp_instance = MTP(mtp_data, engine="jax_new", is_trained=True)
