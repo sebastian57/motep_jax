@@ -1,0 +1,52 @@
+# ---------- Initialize Simulation ---------------------
+units           metal
+dimension       3
+boundary        p p s
+atom_style      atomic
+
+read_data       bulk_ni3al_small.data
+replicate       6 6 6
+# ---------- Define Interatomic Potential ---------------------
+#pair_style jax/mtp_direct jax_potential_gpu.bin 6500 200
+pair_style jax/mtp_direct ./jax_functions_dir 200
+pair_coeff * *
+
+neighbor 1.5 bin  
+neigh_modify every 1 delay 5 check yes  
+
+mass 1 26.98  # Al
+mass 2 58.69  # Ni
+
+######################################
+# Variable
+variable        temperature     equal   100      # Kelvin
+
+# ------------------------- SETTINGS ---------------------------------
+# Define computes for dumping
+compute csym all centro/atom fcc
+compute peratom all pe/atom
+
+#fix test all box/relax x 0 y 0
+#minimize 1.0e-4 1.0e-6 100 1000
+#unfix test
+
+reset_timestep 0
+timestep 0.0001
+
+#velocity all create ${temperature} 12345
+
+#fix 1 all nvt temp ${temperature} ${temperature} 0.1
+fix 1 all npt temp ${temperature} ${temperature} 0.1 x 0 0 1 y 0 0 1
+
+thermo         50
+thermo_style   custom step temp vol pxx pyy pzz pe ke etotal
+
+# ------------------------- DUMP STATEMENTS ---------------------------------
+# Option 1: Basic XYZ dump (most compatible)
+dump xyz_dump all xyz 50 trajectory.dump
+
+run 100
+
+# Clean output
+print "All Done!"
+print "Trajectory written to trajectory.dump"

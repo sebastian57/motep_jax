@@ -1,0 +1,97 @@
+/* -*- c++ -*- ----------------------------------------------------------
+   LAMMPS - Large-scale Atomic/Molecular Massively Parallel Simulator
+   Direct JAX Implementation - Dynamic Array Sizing & Function Selection
+------------------------------------------------------------------------- */
+
+#ifdef PAIR_CLASS
+// clang-format off
+PairStyle(jax/mtp_direct,PairJaxMTPDirect);
+// clang-format on
+#else
+
+#ifndef LMP_PAIR_JAX_MTP_DIRECT_H
+#define LMP_PAIR_JAX_MTP_DIRECT_H
+
+#include "pair.h"
+#include <Python.h>
+#include <string>
+#include <map>
+#include <vector>
+
+namespace LAMMPS_NS {
+
+class PairJaxMTPDirect : public Pair {
+ public:
+  PairJaxMTPDirect(class LAMMPS *);
+  ~PairJaxMTPDirect() override;
+  void compute(int, int) override;
+  void settings(int, char **) override;
+  void coeff(int, char **) override;
+  double init_one(int, int) override;
+  void init_style() override;
+
+ private:
+  char *jax_function_path;     // Path to JAX exported function (.bin file) or directory
+  double cutoff;               // Cutoff distance (extracted from JAX potential)
+  int max_atoms;               // Maximum atoms per computation (dynamic)
+  int max_neighbors;           // Maximum neighbors per atom (runtime argument)
+  
+  // NEW: Dynamic function selection
+  std::string jax_functions_dir;           // Directory containing .bin files
+  std::map<int, PyObject*> function_cache; // Cache for loaded functions
+  std::map<int, std::string> function_files; // Map size -> filename
+  int current_function_size;               // Currently loaded function size
+  
+  // Direct JAX objects
+  PyObject *jax_export_module;   // jax.export module
+  PyObject *jax_function;        // Currently loaded JAX function
+  
+  // Pre-allocated NumPy arrays (reused every timestep)
+  PyObject *itypes_array;
+  PyObject *all_js_array;
+  PyObject *all_rijs_array;
+  PyObject *all_jtypes_array;
+  PyObject *cell_rank_obj;
+  PyObject *volume_obj;
+  PyObject *natoms_actual_obj;
+  PyObject *nneigh_actual_obj;
+  
+  bool python_initialized;
+  
+  // CORE: Direct JAX initialization and execution
+  void init_python_direct();
+  void cleanup_python();
+  void create_reusable_arrays();
+  void cleanup_arrays();  // NEW: Clean up arrays before recreating
+  void update_array_data(int natoms, int* itypes, int** all_js,
+                        double*** all_rijs, int** all_jtypes,
+                        int cell_rank, double volume,
+                        int natoms_actual, int nneigh_actual);
+  
+  int call_jax_direct(int natoms, int* itypes, int** all_js,
+                     double*** all_rijs, int** all_jtypes,
+                     int cell_rank, double volume,
+                     int natoms_actual, int nneigh_actual,
+                     double* energy, double** forces, double* stress);
+  
+  // NEW: Dynamic function management
+  int select_optimal_function_size(int natoms_actual);
+  std::string get_function_filename(int function_size);
+  int load_jax_function_for_size(int function_size);
+  void initialize_function_mapping();
+  int round_up_to_power_of_2(int n, int min_val = 1024);
+  
+  void allocate();
+  
+  // NumPy helper functions
+  PyObject *create_numpy_array_int32(int *data, int dim1);
+  PyObject *create_numpy_array_int32_2d(int **data, int dim1, int dim2);
+  PyObject *create_numpy_array_float32_3d(double ***data, int dim1, int dim2, int dim3);
+  void extract_numpy_array_float32_2d(PyObject *array, double **data, int dim1, int dim2);
+  void extract_numpy_array_float32_1d(PyObject *array, double *data, int dim1);
+};
+
+}
+
+#endif
+#endif
