@@ -45,33 +45,26 @@ static void finalize()
 
 int main(int argc, char **argv)
 {
-  // ✅ CRITICAL: Set JAX ROCm environment BEFORE any LAMMPS/Python initialization
-  std::cout << "🔧 LAMMPS main.cpp: Setting JAX ROCm environment..." << std::endl;
+  // ✅ CRITICAL: Set JAX ROCm GPU environment BEFORE any LAMMPS/Python initialization
+  std::cout << "🔧 LAMMPS main.cpp: Setting JAX ROCm GPU environment..." << std::endl;
   
-  // ROCm-specific environment variables (changed from CUDA)
   setenv("JAX_PLATFORMS", "rocm", 1);
-  setenv("HIP_VISIBLE_DEVICES", "0", 1);                // AMD equivalent of CUDA_VISIBLE_DEVICES
-  setenv("ROCR_VISIBLE_DEVICES", "0", 1);               // ROCm runtime device selection
-  setenv("HSA_OVERRIDE_GFX_VERSION", "9.4.2", 1);      // MI300A architecture
+  setenv("JAX_PLATFORM_NAME", "rocm", 1);
+  setenv("ROCR_VISIBLE_DEVICES", "0,1,2,3", 1);
+  setenv("HIP_VISIBLE_DEVICES", "0,1,2,3", 1);
   setenv("XLA_PYTHON_CLIENT_PREALLOCATE", "false", 1);
-  setenv("XLA_FLAGS", "--xla_gpu_autotune_level=4 --xla_gpu_enable_async_collectives=true", 1);
-  
-  // Additional ROCm optimizations
-  setenv("HIP_LAUNCH_BLOCKING", "0", 1);               // Allow async kernel launches
-  setenv("ROCM_PATH", "/opt/rocm", 1);                 // ROCm installation path
-  setenv("HCC_AMDGPU_TARGET", "gfx942", 1);           // MI300A architecture
+  setenv("XLA_FLAGS", "--xla_gpu_autotune_level=4", 1);
+  setenv("JAX_ENABLE_X64", "false", 1);
   
   // Debug: Verify environment was set
   const char* jax_platforms = getenv("JAX_PLATFORMS");
-  const char* hip_devices = getenv("HIP_VISIBLE_DEVICES");
+  const char* jax_platform_name = getenv("JAX_PLATFORM_NAME");
   const char* rocr_devices = getenv("ROCR_VISIBLE_DEVICES");
-  const char* gfx_version = getenv("HSA_OVERRIDE_GFX_VERSION");
   
   std::cout << "✅ JAX_PLATFORMS: " << (jax_platforms ? jax_platforms : "NOT_SET") << std::endl;
-  std::cout << "✅ HIP_VISIBLE_DEVICES: " << (hip_devices ? hip_devices : "NOT_SET") << std::endl;
+  std::cout << "✅ JAX_PLATFORM_NAME: " << (jax_platform_name ? jax_platform_name : "NOT_SET") << std::endl;
   std::cout << "✅ ROCR_VISIBLE_DEVICES: " << (rocr_devices ? rocr_devices : "NOT_SET") << std::endl;
-  std::cout << "✅ HSA_OVERRIDE_GFX_VERSION: " << (gfx_version ? gfx_version : "NOT_SET") << std::endl;
-  std::cout << "🚀 Starting LAMMPS with ROCm environment pre-configured..." << std::endl;
+  std::cout << "🚀 Starting LAMMPS with ROCm GPU environment pre-configured..." << std::endl;
 
   MPI_Init(&argc, &argv);
   MPI_Comm lammps_comm = MPI_COMM_WORLD;

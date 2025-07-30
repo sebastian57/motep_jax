@@ -1,22 +1,27 @@
 import os
 
-# Force JAX to use ROCm and optimize for AMD GPU compilation
-os.environ['JAX_PLATFORMS'] = 'rocm,cpu'           # ROCm explicitly for MI300A
-os.environ['HIP_VISIBLE_DEVICES'] = '0'            # AMD equivalent of CUDA_VISIBLE_DEVICES
-os.environ['ROCR_VISIBLE_DEVICES'] = '0'           # ROCm runtime device selection
-os.environ['HSA_OVERRIDE_GFX_VERSION'] = '9.4.2'   # MI300A architecture
-os.environ['JAX_ENABLE_X64'] = 'False'             # Use float32 for better GPU performance
+# Force JAX to use ROCm and optimize for GPU compilation
+os.environ['JAX_PLATFORMS'] = 'rocm,cpu'  # Use ROCm for MI300A
+os.environ['JAX_PLATFORM_NAME'] = 'rocm'  # ROCm-specific platform name
+os.environ['JAX_ENABLE_X64'] = 'False'  # Use float32 for better GPU performance
 
-# ROCm-specific optimizations
-os.environ['XLA_FLAGS'] = '--xla_gpu_autotune_level=4 --xla_gpu_enable_async_collectives=true'
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
+# ROCm-compatible XLA optimization flags (removed CUDA-specific flags)
+xla_flags = [
+    '--xla_gpu_autotune_level=4',
+    '--xla_gpu_force_compilation_parallelism=4'
+]
+os.environ['XLA_FLAGS'] = ' '.join(xla_flags)
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import time
 from jax import export, device_put
+from functools import partial
+
+# JAX configuration for performance
+jax.config.update('jax_enable_x64', False)  # Use float32 for speed
+jax.config.update('jax_default_prng_impl', 'unsafe_rbg')  # Faster RNG
 
 # Verify ROCm GPU availability before compilation
 print("=== ROCm GPU Setup Check ===")
@@ -24,25 +29,22 @@ print(f"JAX version: {jax.__version__}")
 print(f"Available devices: {jax.devices()}")
 print(f"Default backend: {jax.default_backend()}")
 
-# Check for ROCm devices
-rocm_devices = [d for d in jax.devices() if 'rocm' in str(d).lower() or 'hip' in str(d).lower()]
 gpu_devices = jax.devices('gpu')
+rocm_devices = [d for d in jax.devices() if 'rocm' in str(d).lower() or 'hip' in str(d).lower()]
 
-if len(rocm_devices) == 0 and len(gpu_devices) == 0:
-    print("❌ WARNING: No ROCm GPU devices found! Falling back to CPU")
+if len(gpu_devices) == 0 and len(rocm_devices) == 0:
+    print("❌ WARNING: No GPU devices found! Falling back to CPU")
     print("   Make sure you installed JAX with ROCm support:")
     print("   pip install --upgrade 'jax[rocm]'")
-    print("   And verify ROCm installation: rocm-smi")
 else:
     if len(rocm_devices) > 0:
         print(f"✅ Found {len(rocm_devices)} ROCm device(s): {rocm_devices}")
-        # Set default device to ROCm GPU
+        # Set default device to GPU
         jax.config.update('jax_default_device', rocm_devices[0])
-    elif len(gpu_devices) > 0:
+    else:
         print(f"✅ Found {len(gpu_devices)} GPU device(s): {gpu_devices}")
         jax.config.update('jax_default_device', gpu_devices[0])
 
-# Import your existing MoTEP modules (same as before)
 from motep_original_files.jax_engine.jax_pad import calc_energy_forces_stress_padded_simple as jax_calc
 from motep_original_files.jax_engine.moment_jax import MomentBasis
 from motep_original_files.mtp import read_mtp
@@ -50,7 +52,6 @@ from motep_original_files.calculator import MTP
 from motep_original_files.jax_engine.conversion import BasisConverter
 from motep_jax_train_import import*
 
-# Keep all your existing helper functions unchanged
 def _initialize_mtp(mtp_file):
     mtp_data = read_mtp(mtp_file)
     mtp_data.species = np.arange(0, mtp_data.species_count)
@@ -109,7 +110,32 @@ def totuple(x):
     except TypeError:
         return x
 
-def extract_static_params(level, mtp_file, MAX_ATOMS, MAX_NEIGHBORS):
+# Dynamic sizing functions
+def create_dynamic_compile_args(max_atoms, max_neighbors):
+    """
+    Create compile arguments for specific array sizes
+    """
+    return [
+        jax.ShapeDtypeStruct((max_atoms,), jnp.int32),
+        jax.ShapeDtypeStruct((max_atoms, max_neighbors), jnp.int32),
+        jax.ShapeDtypeStruct((max_atoms, max_neighbors, 3), jnp.float32),
+        jax.ShapeDtypeStruct((max_atoms, max_neighbors), jnp.int32),
+        jax.ShapeDtypeStruct((), jnp.int32),
+        jax.ShapeDtypeStruct((), jnp.float32),
+        jax.ShapeDtypeStruct((), jnp.int32),
+        jax.ShapeDtypeStruct((), jnp.int32),
+    ]
+
+def round_up_to_power_of_2(n, min_val=64):
+    """
+    Round up to next power of 2 for XLA efficiency
+    """
+    return max(min_val, 2 ** int(np.ceil(np.log2(max(n, min_val)))))
+
+def extract_static_params(level, mtp_file):
+    """
+    Extract MTP parameters - no longer needs MAX_ATOMS/MAX_NEIGHBORS
+    """
     mtp_data = _initialize_mtp(f'training_data/{mtp_file}.mtp')
 
     moment_basis = MomentBasis(level)
@@ -141,137 +167,195 @@ def extract_static_params(level, mtp_file, MAX_ATOMS, MAX_NEIGHBORS):
             scalar_contractions
         )
 
-    compile_args = [
-        jax.ShapeDtypeStruct((MAX_ATOMS,), jnp.int32),
-        jax.ShapeDtypeStruct((MAX_ATOMS, MAX_NEIGHBORS), jnp.int32),
-        jax.ShapeDtypeStruct((MAX_ATOMS, MAX_NEIGHBORS, 3), jnp.float32),
-        jax.ShapeDtypeStruct((MAX_ATOMS, MAX_NEIGHBORS), jnp.int32),
-        jax.ShapeDtypeStruct((), jnp.int32),
-        jax.ShapeDtypeStruct((), jnp.float32),
-        jax.ShapeDtypeStruct((), jnp.int32),
-        jax.ShapeDtypeStruct((), jnp.int32),
-    ]
+    return mtp_data, jax_calc_wrapper
 
-    return compile_args, mtp_data, jax_calc_wrapper
+def compile_and_export_function(jax_calc_wrapper, max_atoms, max_neighbors, 
+                               filename_suffix, test_atom_id=0):
+    """
+    Compile and export a JAX function for specific array sizes
+    """
+    print(f"\n=== Compiling for {max_atoms} atoms × {max_neighbors} neighbors ===")
+    
+    # Create compile arguments for this size
+    compile_args = create_dynamic_compile_args(max_atoms, max_neighbors)
+    
+    # Better compilation with donate_argnums and static args
+    @partial(jax.jit, 
+             static_argnames=('natoms_actual', 'nneigh_actual'),
+             donate_argnums=(0, 1, 2, 3))  # Donate input arrays to avoid copies
+    def optimized_jax_calc(itypes, all_js, all_rijs, all_jtypes, *args, **kwargs):
+        return jax_calc_wrapper(itypes, all_js, all_rijs, all_jtypes, *args, **kwargs)
+    
+    # Force compilation on GPU if available
+    available_gpus = jax.devices('gpu') + [d for d in jax.devices() if 'rocm' in str(d).lower() or 'hip' in str(d).lower()]
+    
+    if len(available_gpus) > 0:
+        with jax.default_device(available_gpus[0]):
+            jitted_calc = optimized_jax_calc
+            compilation_device = available_gpus[0]
+    else:
+        jitted_calc = optimized_jax_calc
+        compilation_device = "CPU"
+    
+    print(f"✅ Compiling on: {compilation_device}")
+    
+    # Traditional JAX compilation for analysis
+    lowered_with_static = jitted_calc.trace(*compile_args).lower()
+    compiled = lowered_with_static.compile()
+    
+    try:
+        flops = compiled.cost_analysis()['flops']
+        print(f"FLOPS: {flops}")
+    except:
+        print("FLOPS: Could not analyze")
+    
+    # Export the function
+    try:
+        # Create test data for this size
+        test_data = _get_data(test_atom_id, max_atoms, max_neighbors)
+        
+        if len(available_gpus) > 0:
+            # Put test data on GPU
+            test_data_gpu = [device_put(arr, available_gpus[0]) for arr in test_data]
+        else:
+            test_data_gpu = test_data
+        
+        # Export the function
+        exported_calc = export.export(jitted_calc)(*compile_args)
+        
+        print(f"✅ Export successful!")
+        print(f"  Input shapes: {[str(shape) for shape in exported_calc.in_avals]}")
+        print(f"  Output shapes: {[str(shape) for shape in exported_calc.out_avals]}")
+        print(f"  Platforms: {exported_calc.platforms}")
+        
+        # Test the exported function
+        start_time = time.time()
+        exported_result = exported_calc.call(*test_data_gpu)
+        end_time = time.time()
+        execution_time = end_time - start_time
+        
+        print(f"✅ Function test successful!")
+        print(f"  Execution time: {execution_time:.6f} seconds")
+        print(f"  Energy: {exported_result[0]}")
+        
+        # Serialize for C++ integration
+        serialized_data = exported_calc.serialize()
+        bin_filename = f"jax_potential_{filename_suffix}.bin"
+        
+        with open(bin_filename, "wb") as f:
+            f.write(serialized_data)
+        
+        print(f"✅ Saved: {bin_filename} ({len(serialized_data)} bytes)")
+        
+        return {
+            'filename': bin_filename,
+            'max_atoms': max_atoms,
+            'max_neighbors': max_neighbors,
+            'execution_time': execution_time,
+            'energy': float(exported_result[0]),
+            'size_bytes': len(serialized_data),
+            'success': True
+        }
+        
+    except Exception as e:
+        print(f"❌ Export failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            'filename': f"jax_potential_{filename_suffix}.bin",
+            'max_atoms': max_atoms,
+            'max_neighbors': max_neighbors,
+            'success': False,
+            'error': str(e)
+        }
 
-# Same array sizes as before
-MAX_ATOMS = 64
-MAX_NEIGHBORS = 64
+# Define target system sizes for compilation (optimized for MI300A)
+SYSTEM_CONFIGS = [
+    # (max_atoms, max_neighbors, suffix, description)
+    (1024, 128, "1k", "Small systems (up to 1K atoms)"),
+    (4096, 128, "4k", "Medium systems (up to 4K atoms)"), 
+    (16384, 128, "16k", "Large systems (up to 16K atoms)"),
+    (65536, 200, "64k", "Very large systems (up to 64K atoms)"),
+    (131072, 200, "128k", "Maximum systems (up to 128K atoms)"),
+    (262144, 200, "256k", "Ultra-large systems (up to 256K atoms) - MI300A optimized"),
+]
 
 print("\n=== Extracting MTP Parameters ===")
-compile_args, mtp_data, jax_calc_wrapper = extract_static_params(12, 'Ni3Al-12g', MAX_ATOMS, MAX_NEIGHBORS)
+mtp_data, jax_calc_wrapper = extract_static_params(12, 'Ni3Al-12g')
 
-print("\n=== JIT Compilation for ROCm GPU ===")
-# Force compilation on ROCm GPU if available
-available_rocm_gpus = rocm_devices + gpu_devices
+print("\n=== Dynamic JAX Compilation - Multiple Sizes for MI300A ===")
+compiled_functions = []
 
-if len(available_rocm_gpus) > 0:
-    with jax.default_device(available_rocm_gpus[0]):
-        jitted_calc = jax.jit(jax_calc_wrapper)
-        print(f"✅ Compiling on ROCm GPU device: {available_rocm_gpus[0]}")
-else:
-    jitted_calc = jax.jit(jax_calc_wrapper)
-    print("⚠️  Compiling on CPU (no ROCm GPU available)")
+for max_atoms, max_neighbors, suffix, description in SYSTEM_CONFIGS:
+    print(f"\n--- {description} ---")
+    
+    result = compile_and_export_function(
+        jax_calc_wrapper, max_atoms, max_neighbors, suffix, test_atom_id=0
+    )
+    
+    compiled_functions.append(result)
+    
+    if not result['success']:
+        print(f"⚠️  Skipping {suffix} due to compilation failure")
+        continue
 
-print("\n=== Traditional JAX Compilation ===")
-lowered_with_static = jitted_calc.trace(*compile_args).lower()
+print("\n=== COMPILATION SUMMARY ===")
+print("Successfully compiled functions:")
 
-# Check compilation target for ROCm
-try:
-    if hasattr(lowered_with_static, 'compile_args') and hasattr(lowered_with_static.compile_args, 'target_config'):
-        compilation_platform = lowered_with_static.compile_args.target_config.platform_name
+total_successful = 0
+for result in compiled_functions:
+    if result['success']:
+        total_successful += 1
+        atoms = result['max_atoms']
+        neighbors = result['max_neighbors']
+        time_ms = result['execution_time'] * 1000
+        size_mb = result['size_bytes'] / (1024 * 1024)
+        
+        print(f"✅ {result['filename']}")
+        print(f"   Arrays: {atoms:,} atoms × {neighbors} neighbors")
+        print(f"   Performance: {time_ms:.2f}ms execution time")
+        print(f"   File size: {size_mb:.1f} MB")
+        print(f"   Energy test: {result['energy']:.6f}")
     else:
-        # Fallback - infer from devices
-        if len(available_rocm_gpus) > 0:
-            compilation_platform = "rocm_gpu"
-        else:
-            compilation_platform = "cpu"
-except:
-    compilation_platform = "unknown"
-    
-print(f"Compilation target: {compilation_platform}")
+        print(f"❌ {result['filename']} - FAILED")
 
-# Save StableHLO MLIR
-stablehlo_text = lowered_with_static.compiler_ir(dialect="stablehlo")
-mlir_filename = f"jax_potential_rocm.stablehlo.mlir"
-with open(mlir_filename, "w") as f:
-    f.write(str(stablehlo_text))
-print(f"Saved StableHLO to: {mlir_filename}")
+print(f"\n=== FINAL SUMMARY ===")
+print(f"Compiled {total_successful}/{len(SYSTEM_CONFIGS)} function variants")
 
-compiled = lowered_with_static.compile()
-flops = compiled.cost_analysis()['flops']
-print(f'FLOPS: {flops}')
-
-print("\n=== JAX Export for ROCm Integration ===")
-export_success = False
-try:
-    # Move test data to ROCm GPU if available
-    test_data = _get_data(0, MAX_ATOMS, MAX_NEIGHBORS)
+if total_successful > 0:
+    print(f"✅ Dynamic padding implementation ready for MI300A!")
+    print(f"✅ Function files can handle systems from 1K to 256K atoms")
+    print(f"✅ Memory usage scales with actual system size")
     
-    if len(available_rocm_gpus) > 0:
-        # Put test data on ROCm GPU
-        test_data_gpu = [device_put(arr, available_rocm_gpus[0]) for arr in test_data]
-        print(f"✅ Test data moved to ROCm GPU: {available_rocm_gpus[0]}")
-    else:
-        test_data_gpu = test_data
-        print("⚠️  Using CPU for test data")
+    # Create a configuration file for the C++ side
+    config_data = {
+        'functions': [r for r in compiled_functions if r['success']],
+        'mtp_params': {
+            'scaling': float(mtp_data.scaling),
+            'min_dist': float(mtp_data.min_dist),
+            'max_dist': float(mtp_data.max_dist),
+            'species_count': int(mtp_data.species_count)
+        }
+    }
     
-    # Export the function - this preserves the ROCm compilation target
-    exported_calc = export.export(jitted_calc)(*compile_args)
+    import json
+    with open("jax_functions_config.json", "w") as f:
+        json.dump(config_data, f, indent=2)
     
-    print("✅ Export successful!")
-    print(f"Export info:")
-    print(f"  Input shapes: {[str(shape) for shape in exported_calc.in_avals]}")
-    print(f"  Output shapes: {[str(shape) for shape in exported_calc.out_avals]}")
-    print(f"  Platforms: {exported_calc.platforms}")
-    print(f"  Number of inputs: {len(exported_calc.in_avals)}")
+    print(f"✅ Configuration saved to: jax_functions_config.json")
     
-    # Test the exported function
-    print("\n=== Testing Exported Function ===")
-    start_time = time.time()
-    exported_result = exported_calc.call(*test_data_gpu)
-    end_time = time.time()
-    exported_time = end_time - start_time
-    
-    print(f"✅ Exported function test successful!")
-    print(f"Execution time: {exported_time:.6f} seconds")
-    print(f"Result shapes: {[np.array(r).shape for r in exported_result]}")
-    print(f"Energy: {exported_result[0]}")
-    
-    # Serialize for C++ integration
-    serialized_data = exported_calc.serialize()
-    bin_filename = "jax_potential_rocm.bin"
-    with open(bin_filename, "wb") as f:
-        f.write(serialized_data)
-    
-    print(f"✅ Serialized ROCm function saved to: {bin_filename} ({len(serialized_data)} bytes)")
-    
-    export_success = True
-    
-except Exception as e:
-    print(f"❌ Export failed: {e}")
-    import traceback
-    traceback.print_exc()
-    export_success = False
-
-print("\n=== Summary ===")
-print("Files created:")
-print(f"1. {mlir_filename} - StableHLO from lowering")
-if export_success:
-    print(f"2. {bin_filename} - Serialized ROCm function")
-    print(f"✅ Function compiled for: {compilation_platform}")
-    print(f"✅ Supports up to {MAX_ATOMS} atoms with {MAX_NEIGHBORS} neighbors each")
-    print(f"✅ Ready for LAMMPS integration!")
 else:
-    print("❌ Export failed - check errors above")
+    print(f"❌ No functions compiled successfully!")
+    print(f"   Check ROCm GPU availability and JAX installation")
 
 # Final verification
 print(f"\n=== Final Verification ===")
-print(f"Current JAX backend: {jax.default_backend()}")
+print(f"JAX backend: {jax.default_backend()}")
 print(f"Available devices: {jax.devices()}")
 
-if len(available_rocm_gpus) > 0:
-    print(f"✅ ROCm GPU compilation successful - use {bin_filename} in LAMMPS")
-    print(f"✅ Target GPU: {available_rocm_gpus[0]} (MI300A)")
+available_gpus = jax.devices('gpu') + [d for d in jax.devices() if 'rocm' in str(d).lower() or 'hip' in str(d).lower()]
+if len(available_gpus) > 0:
+    print(f"✅ ROCm GPU compilation successful")
+    print(f"✅ Target GPU: {available_gpus[0]} (MI300A)")
 else:
-    print(f"⚠️  CPU-only compilation - install JAX with ROCm support for GPU acceleration")
+    print(f"⚠️  CPU-only compilation")

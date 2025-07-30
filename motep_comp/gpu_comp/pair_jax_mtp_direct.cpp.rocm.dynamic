@@ -1,6 +1,6 @@
 /* ----------------------------------------------------------------------
    LAMMPS - Large-scale Atomic/Molecular Massively Parallel Simulator
-   Direct JAX Implementation - Dynamic Array Sizing for ROCm/MI300A
+   Direct JAX Implementation - Dynamic Array Sizing & Function Selection for ROCm/MI300A
 ------------------------------------------------------------------------- */
 
 #include "pair_jax_mtp_direct.h"
@@ -23,6 +23,7 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <vector>
 
 // Python/NumPy headers
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
@@ -43,6 +44,10 @@ PairJaxMTPDirect::PairJaxMTPDirect(LAMMPS *lmp) : Pair(lmp)
   cutoff = 5.0;                // Default cutoff (will be overridden by JAX potential)
   max_atoms = 0;               // Set from input arguments
   max_neighbors = 0;           // Set from input arguments
+  
+  // Dynamic function selection
+  jax_functions_dir = "";
+  current_function_size = 0;
   
   jax_export_module = nullptr;
   jax_function = nullptr;
@@ -100,6 +105,18 @@ void PairJaxMTPDirect::compute(int eflag, int vflag)
   const double SAFE_DISTANCE = cutoff + 2.0;
 
   int natoms_actual = std::min(inum, max_atoms);
+
+  // Dynamic function selection for optimal performance
+  if (!jax_functions_dir.empty()) {
+    int optimal_size = select_optimal_function_size(inum);  // Use inum (actual atoms) for selection
+    
+    if (load_jax_function_for_size(optimal_size) == 0) {
+      error->one(FLERR, "Failed to load optimal JAX function");
+    }
+    
+    // Update natoms_actual based on loaded function
+    natoms_actual = std::min(inum, max_atoms);
+  }
 
   // Allocate arrays with dynamic sizes
   int *itypes = new int[max_atoms];
@@ -206,30 +223,57 @@ void PairJaxMTPDirect::compute(int eflag, int vflag)
 
 void PairJaxMTPDirect::settings(int narg, char **arg)
 {
-  if (narg < 3) error->all(FLERR, "Illegal pair_style command - usage: pair_style jax/mtp_direct <bin_file> <max_atoms> <max_neighbors>");
+  if (narg < 1) error->all(FLERR, "Illegal pair_style command - usage: pair_style jax/mtp_direct <functions_dir_or_bin_file> [max_neighbors] [additional_args]");
 
-  // Argument 0: JAX function file path
+  // Argument 0: JAX functions directory or single .bin file
   int n = strlen(arg[0]) + 1;
   jax_function_path = new char[n];
   strcpy(jax_function_path, arg[0]);
 
-  // Argument 1: Maximum atoms per computation
-  max_atoms = utils::inumeric(FLERR, arg[1], false, lmp);
-  if (max_atoms <= 0) error->all(FLERR, "Maximum atoms must be positive");
+  // Check if it's a directory (contains multiple .bin files) or single file
+  std::string path_str(arg[0]);
+  if (path_str.find(".bin") != std::string::npos) {
+    // Single .bin file mode (backward compatibility)
+    jax_functions_dir = "";
+    
+    // Get max_atoms and max_neighbors from arguments (old format)
+    if (narg >= 3) {
+      max_atoms = utils::inumeric(FLERR, arg[1], false, lmp);
+      max_neighbors = utils::inumeric(FLERR, arg[2], false, lmp);
+    } else {
+      // Default values for single file mode
+      max_atoms = 65536;  // 64k atoms
+      max_neighbors = 200;
+    }
+  } else {
+    // Directory mode (new dynamic selection)
+    jax_functions_dir = path_str;
+    
+    // Set maximum possible size for MI300A (will be adjusted dynamically)
+    max_atoms = 262144;  // 256k atoms max for MI300A
+    max_neighbors = 200;
+    
+    // In directory mode, argument 1 is max_neighbors
+    if (narg >= 2) max_neighbors = utils::inumeric(FLERR, arg[1], false, lmp);
+  }
 
-  // Argument 2: Maximum neighbors per atom
-  max_neighbors = utils::inumeric(FLERR, arg[2], false, lmp);
+  if (max_atoms <= 0) error->all(FLERR, "Maximum atoms must be positive");
   if (max_neighbors <= 0) error->all(FLERR, "Maximum neighbors must be positive");
 
-  // Set cutoff to reasonable default (actual cutoff is baked into JAX potential)
-  cutoff = 5.0;
+  cutoff = 5.0;  // Default cutoff
+  current_function_size = 0;  // No function loaded yet
 
   if (comm->me == 0) {
-    utils::logmesg(lmp, "JAX/MTP Direct pair style settings:\n");
-    utils::logmesg(lmp, "  JAX function file: {}\n", jax_function_path);
-    utils::logmesg(lmp, "  Maximum atoms: {}\n", max_atoms);
-    utils::logmesg(lmp, "  Maximum neighbors: {}\n", max_neighbors);
-    utils::logmesg(lmp, "  Default cutoff: {:.3f} (actual cutoff baked into JAX potential)\n", cutoff);
+    utils::logmesg(lmp, "JAX/MTP Direct pair style settings (ROCm):\n");
+    if (jax_functions_dir.empty()) {
+      utils::logmesg(lmp, "  Single JAX function file: {}\n", jax_function_path);
+      utils::logmesg(lmp, "  Fixed array size: {} atoms x {} neighbors\n", max_atoms, max_neighbors);
+    } else {
+      utils::logmesg(lmp, "  JAX functions directory: {}\n", jax_functions_dir.c_str());
+      utils::logmesg(lmp, "  Dynamic function selection: ENABLED\n");
+      utils::logmesg(lmp, "  Maximum capacity: {} atoms x {} neighbors\n", max_atoms, max_neighbors);
+    }
+    utils::logmesg(lmp, "  Default cutoff: {:.3f}\n", cutoff);
   }
 }
 
@@ -295,10 +339,14 @@ void PairJaxMTPDirect::init_python_direct()
 
   if (comm->me == 0) {
     utils::logmesg(lmp, "=== JAX ROCm INITIALIZATION DEBUG ===\n");
-    utils::logmesg(lmp, "Using dynamic array sizes: {} atoms x {} neighbors\n", max_atoms, max_neighbors);
+    if (jax_functions_dir.empty()) {
+      utils::logmesg(lmp, "Single function mode: {} atoms x {} neighbors\n", max_atoms, max_neighbors);
+    } else {
+      utils::logmesg(lmp, "Dynamic function mode: up to {} atoms x {} neighbors\n", max_atoms, max_neighbors);
+    }
   }
 
-  // Restart Python interpreter
+  // Python initialization with ROCm environment setup
   if (Py_IsInitialized()) {
     Py_Finalize();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -326,7 +374,6 @@ void PairJaxMTPDirect::init_python_direct()
     if (comm->me == 0) {
       utils::logmesg(lmp, "✅ JAX imported successfully\n");
       
-      // Get JAX devices
       PyObject *devices_func = PyObject_GetAttrString(jax_module, "devices");
       if (devices_func) {
         PyObject *devices_result = PyObject_CallObject(devices_func, nullptr);
@@ -365,15 +412,203 @@ void PairJaxMTPDirect::init_python_direct()
     error->one(FLERR, "Failed to import jax.export module");
   }
 
-  PyObject *deserialize_func = PyObject_GetAttrString(jax_export_module, "deserialize");
-  if (deserialize_func == nullptr) {
-    error->one(FLERR, "Cannot find jax.export.deserialize function");
+  // Initialize function mapping for dynamic selection
+  if (!jax_functions_dir.empty()) {
+    initialize_function_mapping();
+  } else {
+    // Single file mode - load the specified function
+    PyObject *deserialize_func = PyObject_GetAttrString(jax_export_module, "deserialize");
+    if (deserialize_func == nullptr) {
+      error->one(FLERR, "Cannot find jax.export.deserialize function");
+    }
+
+    FILE *file = fopen(jax_function_path, "rb");
+    if (!file) {
+      error->one(FLERR, "Cannot open JAX function file");
+    }
+
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    char *file_data = new char[file_size];
+    size_t bytes_read = fread(file_data, 1, file_size, file);
+    fclose(file);
+
+    if (bytes_read != file_size) {
+      delete[] file_data;
+      error->one(FLERR, "Failed to read JAX function file completely");
+    }
+
+    PyObject *serialized_data = PyBytes_FromStringAndSize(file_data, file_size);
+    delete[] file_data;
+
+    jax_function = PyObject_CallFunctionObjArgs(deserialize_func, serialized_data, nullptr);
+    
+    if (jax_function == nullptr) {
+      PyErr_Print();
+      error->one(FLERR, "Failed to deserialize JAX function");
+    }
+
+    Py_DECREF(deserialize_func);
+    Py_DECREF(serialized_data);
   }
 
-  // Read JAX function file
-  FILE *file = fopen(jax_function_path, "rb");
+  // Create arrays with current max sizes
+  create_reusable_arrays();
+
+  python_initialized = true;
+
+  if (comm->me == 0) {
+    if (jax_functions_dir.empty()) {
+      utils::logmesg(lmp, "🚀 JAX potential initialized (single function) for ROCm\n");
+      utils::logmesg(lmp, "   Function loaded from: {}\n", jax_function_path);
+    } else {
+      utils::logmesg(lmp, "🚀 JAX potential initialized (dynamic selection) for ROCm\n");
+      utils::logmesg(lmp, "   Functions directory: {}\n", jax_functions_dir.c_str());
+    }
+    utils::logmesg(lmp, "   Array dimensions: {} x {} x 3\n", max_atoms, max_neighbors);
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+// Round up to next power of 2
+int PairJaxMTPDirect::round_up_to_power_of_2(int n, int min_val)
+{
+  if (n <= min_val) return min_val;
+  
+  int power = 1;
+  while (power < n) {
+    power *= 2;
+  }
+  return power;
+}
+
+/* ---------------------------------------------------------------------- */
+// Select optimal function size based on actual atom count
+int PairJaxMTPDirect::select_optimal_function_size(int natoms_actual)
+{
+  // Round up to next power of 2, minimum 1024
+  int required_size = round_up_to_power_of_2(natoms_actual, 1024);
+  
+  // Available function sizes (must match ROCm compilation script)
+  std::vector<int> available_sizes = {1024, 4096, 16384, 65536, 131072, 262144};
+  
+  // Find smallest available size that fits
+  for (int size : available_sizes) {
+    if (size >= required_size && function_files.find(size) != function_files.end()) {
+      return size;
+    }
+  }
+  
+  // Return largest available size if none fit
+  for (auto it = available_sizes.rbegin(); it != available_sizes.rend(); ++it) {
+    if (function_files.find(*it) != function_files.end()) {
+      return *it;
+    }
+  }
+  
+  // This shouldn't happen if initialize_function_mapping worked
+  error->one(FLERR, "No suitable JAX function found");
+  return 1024;
+}
+
+/* ---------------------------------------------------------------------- */
+// Get filename for function size
+std::string PairJaxMTPDirect::get_function_filename(int function_size)
+{
+  std::string suffix;
+  
+  switch (function_size) {
+    case 1024:   suffix = "1k"; break;
+    case 4096:   suffix = "4k"; break;
+    case 16384:  suffix = "16k"; break;
+    case 65536:  suffix = "64k"; break;
+    case 131072: suffix = "128k"; break;
+    case 262144: suffix = "256k"; break;  // Added for MI300A
+    default:
+      error->one(FLERR, "Unsupported function size requested");
+      return "";
+  }
+  
+  return jax_functions_dir + "/jax_potential_" + suffix + ".bin";
+}
+
+/* ---------------------------------------------------------------------- */
+// Initialize function mapping
+void PairJaxMTPDirect::initialize_function_mapping()
+{
+  // Create mapping of sizes to filenames (optimized for MI300A)
+  std::vector<int> sizes = {1024, 4096, 16384, 65536, 131072, 262144};
+  
+  if (comm->me == 0) {
+    utils::logmesg(lmp, "Scanning for JAX function files:\n");
+  }
+  
+  for (int size : sizes) {
+    std::string filename = get_function_filename(size);
+    
+    // Check if file exists
+    FILE *test_file = fopen(filename.c_str(), "rb");
+    if (test_file) {
+      fclose(test_file);
+      function_files[size] = filename;
+      
+      if (comm->me == 0) {
+        utils::logmesg(lmp, "   Found function: {} atoms -> {}\n", size, filename.c_str());
+      }
+    } else {
+      if (comm->me == 0) {
+        utils::logmesg(lmp, "   Missing function: {} atoms -> {}\n", size, filename.c_str());
+      }
+    }
+  }
+  
+  if (function_files.empty()) {
+    error->one(FLERR, "No JAX function files found in directory");
+  }
+  
+  if (comm->me == 0) {
+    utils::logmesg(lmp, "Found {} JAX function files\n", function_files.size());
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+// Load JAX function for specific size
+int PairJaxMTPDirect::load_jax_function_for_size(int function_size)
+{
+  // Check if already loaded
+  if (current_function_size == function_size && jax_function != nullptr) {
+    return 1;  // Already loaded
+  }
+  
+  // Check if function file exists
+  if (function_files.find(function_size) == function_files.end()) {
+    return 0;  // Function not available
+  }
+  
+  std::string filename = function_files[function_size];
+  
+  if (comm->me == 0) {
+    utils::logmesg(lmp, "Loading JAX function: {} atoms from {}\n", function_size, filename.c_str());
+  }
+  
+  // Clean up previous function
+  if (jax_function != nullptr) {
+    Py_DECREF(jax_function);
+    jax_function = nullptr;
+  }
+  
+  // Load new function
+  PyObject *deserialize_func = PyObject_GetAttrString(jax_export_module, "deserialize");
+  if (deserialize_func == nullptr) {
+    return 0;
+  }
+
+  FILE *file = fopen(filename.c_str(), "rb");
   if (!file) {
-    error->one(FLERR, "Cannot open JAX function file");
+    Py_DECREF(deserialize_func);
+    return 0;
   }
 
   fseek(file, 0, SEEK_END);
@@ -386,7 +621,8 @@ void PairJaxMTPDirect::init_python_direct()
 
   if (bytes_read != file_size) {
     delete[] file_data;
-    error->one(FLERR, "Failed to read JAX function file completely");
+    Py_DECREF(deserialize_func);
+    return 0;
   }
 
   PyObject *serialized_data = PyBytes_FromStringAndSize(file_data, file_size);
@@ -394,24 +630,39 @@ void PairJaxMTPDirect::init_python_direct()
 
   jax_function = PyObject_CallFunctionObjArgs(deserialize_func, serialized_data, nullptr);
   
-  if (jax_function == nullptr) {
-    PyErr_Print();
-    error->one(FLERR, "Failed to deserialize JAX function");
-  }
-
-  // Create arrays with dynamic sizes
-  create_reusable_arrays();
-
   Py_DECREF(deserialize_func);
   Py_DECREF(serialized_data);
-
-  python_initialized = true;
-
-  if (comm->me == 0) {
-    utils::logmesg(lmp, "🚀 JAX potential initialized with dynamic sizing for ROCm\n");
-    utils::logmesg(lmp, "   Function loaded from: {}\n", jax_function_path);
-    utils::logmesg(lmp, "   Array dimensions: {} x {} x 3\n", max_atoms, max_neighbors);
+  
+  if (jax_function == nullptr) {
+    PyErr_Print();
+    return 0;
   }
+  
+  current_function_size = function_size;
+  
+  // Update max_atoms to match loaded function
+  max_atoms = function_size;
+  
+  // Recreate arrays with new size
+  cleanup_arrays();
+  create_reusable_arrays();
+  
+  return 1;
+}
+
+/* ---------------------------------------------------------------------- */
+// Cleanup arrays
+void PairJaxMTPDirect::cleanup_arrays()
+{
+  Py_XDECREF(itypes_array);
+  Py_XDECREF(all_js_array);
+  Py_XDECREF(all_rijs_array);
+  Py_XDECREF(all_jtypes_array);
+  
+  itypes_array = nullptr;
+  all_js_array = nullptr;
+  all_rijs_array = nullptr;
+  all_jtypes_array = nullptr;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -691,14 +942,18 @@ void PairJaxMTPDirect::cleanup_python()
 {
   if (!python_initialized) return;
 
-  Py_XDECREF(itypes_array);
-  Py_XDECREF(all_js_array);
-  Py_XDECREF(all_rijs_array);
-  Py_XDECREF(all_jtypes_array);
+  cleanup_arrays();
+  
   Py_XDECREF(cell_rank_obj);
   Py_XDECREF(volume_obj);
   Py_XDECREF(natoms_actual_obj);
   Py_XDECREF(nneigh_actual_obj);
+
+  // Clean up function cache
+  for (auto& pair : function_cache) {
+    Py_XDECREF(pair.second);
+  }
+  function_cache.clear();
 
   Py_XDECREF(jax_function);
   Py_XDECREF(jax_export_module);
