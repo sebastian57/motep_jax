@@ -1,0 +1,119 @@
+/* ----------------------------------------------------------------------
+   LAMMPS - Large-scale Atomic/Molecular Massively Parallel Simulator
+   Header for Direct JAX Implementation - WITH CPU INTERFACE OPTIMIZATION
+------------------------------------------------------------------------- */
+
+#ifdef PAIR_CLASS
+// clang-format off
+PairStyle(jax/mtp_direct,PairJaxMTPDirect);
+// clang-format on
+#else
+
+#ifndef LMP_PAIR_JAX_MTP_DIRECT_H
+#define LMP_PAIR_JAX_MTP_DIRECT_H
+
+#include "pair.h"
+#include <string>
+#include <map>
+#include <vector>
+
+// Forward declarations
+struct _object;
+typedef _object PyObject;
+
+namespace LAMMPS_NS {
+
+class PairJaxMTPDirect : public Pair {
+ public:
+  PairJaxMTPDirect(class LAMMPS *);
+  ~PairJaxMTPDirect() override;
+  
+  void compute(int, int) override;
+  void settings(int, char **) override;
+  void coeff(int, char **) override;
+  double init_one(int, int) override;
+  void init_style() override;
+
+ protected:
+  virtual void allocate();
+
+  // Core JAX integration
+  char *jax_function_path;
+  double cutoff;
+  int max_atoms;
+  int max_neighbors;
+  
+  // NEW: Dynamic function selection
+  std::string jax_functions_dir;
+  std::map<int, std::string> function_files;
+  int current_function_size;
+  
+  // Python/JAX objects
+  PyObject *jax_export_module;
+  PyObject *jax_function;
+  bool python_initialized;
+  
+  // Reusable NumPy arrays for efficiency
+  PyObject *itypes_array;
+  PyObject *all_js_array;
+  PyObject *all_rijs_array;
+  PyObject *all_jtypes_array;
+  PyObject *cell_rank_obj;
+  PyObject *volume_obj;
+  PyObject *natoms_actual_obj;
+  PyObject *nneigh_actual_obj;
+  
+  // NEW: CPU Interface Optimization components
+  PyObject *ultimate_optimizer;          // Ultimate interface optimizer instance
+  PyObject *optimization_config;         // Configuration object
+  PyObject *mtp_params_dict;            // MTP parameters for optimizer
+  bool use_optimized_interface;          // Flag to enable/disable optimization
+  
+  // NEW: Performance monitoring
+  double total_optimization_time;        // Total time spent in optimized calls
+  int optimization_call_count;           // Number of optimization calls
+  double best_speedup_achieved;          // Best speedup factor observed
+  double baseline_time_accumulator;      // For comparison measurements
+  double optimized_time_accumulator;     // For optimized measurements
+  
+  // Core methods
+  int init_python();
+  int load_jax_function();
+  void create_reusable_arrays();
+  void update_array_data(int natoms_used, int nneigh_max, int inum, int *ilist, int *numneigh, int **firstneigh);
+  void call_jax_direct(int eflag, int vflag, int natoms_used, int nneigh_max);
+  void extract_results_from_python(PyObject *result, int eflag, int vflag, int natoms_used);
+  void cleanup_arrays();
+  void cleanup_python();
+  
+  // NEW: Dynamic function selection methods
+  int round_up_to_power_of_2(int n, int min_val);
+  int select_optimal_function_size(int natoms_actual);
+  std::string get_function_filename(int function_size);
+  void initialize_function_mapping();
+  int load_jax_function_for_size(int function_size);
+  
+  // NEW: CPU Interface Optimization methods
+  void init_optimized_interface();
+  void cleanup_optimized_interface();
+  void call_jax_optimized(int eflag, int vflag, int natoms_used, int nneigh_max);
+  void log_optimization_performance();
+  void create_mtp_params_dict();
+  
+  // NEW: Configuration and validation methods
+  void configure_optimization(const std::string& config_string);
+  void handle_optimization_error(const std::string& error_msg);
+  void benchmark_optimization(int num_iterations = 10);
+  
+  // Utility methods for NumPy array handling
+  PyObject *create_numpy_array_int32(int *data, int dim1);
+  PyObject *create_numpy_array_int32_2d(int **data, int dim1, int dim2);
+  PyObject *create_numpy_array_float32_3d(double ***data, int dim1, int dim2, int dim3);
+  void extract_numpy_array_float32_2d(PyObject *array, double **data, int dim1, int dim2);
+  void extract_numpy_array_float32_1d(PyObject *array, double *data, int dim1);
+};
+
+}    // namespace LAMMPS_NS
+
+#endif
+#endif

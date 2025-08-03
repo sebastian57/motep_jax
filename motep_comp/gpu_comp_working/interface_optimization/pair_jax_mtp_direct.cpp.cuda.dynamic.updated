@@ -1,0 +1,1239 @@
+/* ----------------------------------------------------------------------
+   LAMMPS - Large-scale Atomic/Molecular Massively Parallel Simulator
+   Direct JAX Implementation - Dynamic Array Sizing & Function Selection
+   WITH CPU INTERFACE OPTIMIZATION
+------------------------------------------------------------------------- */
+
+#include "pair_jax_mtp_direct.h"
+
+#include "atom.h"
+#include "comm.h"
+#include "domain.h"
+#include "error.h"
+#include "force.h"
+#include "memory.h"
+#include "neigh_list.h"
+#include "neighbor.h"
+#include "update.h"
+
+#include <cmath>
+#include <cstring>
+#include <cstdlib>
+#include <algorithm>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <chrono>
+#include <vector>
+
+// Python/NumPy headers
+#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
+#include <numpy/arrayobject.h>
+
+using namespace LAMMPS_NS;
+
+/* ---------------------------------------------------------------------- */
+
+PairJaxMTPDirect::PairJaxMTPDirect(LAMMPS *lmp) : Pair(lmp)
+{
+  single_enable = 0;
+  restartinfo = 0;
+  one_coeff = 1;
+  manybody_flag = 1;
+  
+  jax_function_path = nullptr;
+  cutoff = 5.0;                // Default cutoff (will be overridden by JAX potential)
+  max_atoms = 0;               // Set from input arguments
+  max_neighbors = 0;           // Set from input arguments
+  
+  // NEW: Dynamic function selection
+  jax_functions_dir = "";
+  current_function_size = 0;
+  
+  jax_export_module = nullptr;
+  jax_function = nullptr;
+  
+  itypes_array = nullptr;
+  all_js_array = nullptr;
+  all_rijs_array = nullptr;
+  all_jtypes_array = nullptr;
+  cell_rank_obj = nullptr;
+  volume_obj = nullptr;
+  natoms_actual_obj = nullptr;
+  nneigh_actual_obj = nullptr;
+  
+  python_initialized = false;
+  
+  // NEW: CPU Interface Optimization components
+  ultimate_optimizer = nullptr;
+  optimization_config = nullptr;
+  use_optimized_interface = true;  // Enable by default
+  
+  // Performance monitoring
+  total_optimization_time = 0.0;
+  optimization_call_count = 0;
+  best_speedup_achieved = 1.0;
+  baseline_time_accumulator = 0.0;
+  optimized_time_accumulator = 0.0;
+  
+  // MTP parameters for optimizer
+  mtp_params_dict = nullptr;
+}
+
+/* ---------------------------------------------------------------------- */
+
+PairJaxMTPDirect::~PairJaxMTPDirect()
+{
+  cleanup_optimized_interface();
+  cleanup_python();
+  delete[] jax_function_path;
+  
+  if (allocated) {
+    memory->destroy(setflag);
+    memory->destroy(cutsq);
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairJaxMTPDirect::compute(int eflag, int vflag)
+{
+  int i, j, ii, jj, inum, jnum, itype, jtype;
+  double xtmp, ytmp, ztmp, delx, dely, delz, rsq;
+  int *ilist, *jlist, *numneigh, **firstneigh;
+
+  double **x = atom->x;
+  double **f = atom->f;
+  int *type = atom->type;
+  int nlocal = atom->nlocal;
+  int newton_pair = force->newton_pair;
+
+  inum = list->inum;
+  ilist = list->ilist;
+  numneigh = list->numneigh;
+  firstneigh = list->firstneigh;
+
+  ev_init(eflag, vflag);
+
+  if (newton_pair)
+    error->all(FLERR, "JAX/MTP pair style requires 'newton off'");
+
+  if (!python_initialized) {
+    error->all(FLERR, "JAX/MTP pair style not properly initialized");
+  }
+
+  // NEW: Dynamic function selection based on actual atom count
+  if (!jax_functions_dir.empty()) {
+    int optimal_size = select_optimal_function_size(inum);
+    int load_result = load_jax_function_for_size(optimal_size);
+    
+    if (!load_result) {
+      if (comm->me == 0) {
+        utils::logmesg(lmp, "Warning: Could not load optimal JAX function (size {})\n", optimal_size);
+      }
+    }
+  }
+
+  if (jax_function == nullptr) {
+    error->all(FLERR, "No JAX function loaded");
+  }
+
+  // Validate array sizes
+  if (inum > max_atoms) {
+    error->all(FLERR, 
+      "Number of local atoms ({}) exceeds maximum supported ({}). "
+      "Use larger .bin file or increase array size.", inum, max_atoms);
+  }
+
+  // Build neighbor data
+  int natoms_used = 0;
+  int nneigh_max = 0;
+  
+  for (ii = 0; ii < inum; ii++) {
+    i = ilist[ii];
+    jnum = numneigh[i];
+    if (jnum > max_neighbors) {
+      error->all(FLERR, 
+        "Number of neighbors ({}) exceeds maximum supported ({}). "
+        "Increase max_neighbors parameter.", jnum, max_neighbors);
+    }
+    if (jnum > nneigh_max) nneigh_max = jnum;
+    natoms_used++;
+  }
+
+  // Update reusable arrays with current data
+  update_array_data(natoms_used, nneigh_max, inum, ilist, numneigh, firstneigh);
+
+  // MAIN CHANGE: Choose optimized or fallback interface
+  double compute_start_time = MPI_Wtime();
+  
+  if (use_optimized_interface && ultimate_optimizer) {
+    // Use optimized interface
+    call_jax_optimized(eflag, vflag, natoms_used, nneigh_max);
+  } else {
+    // Fallback to original interface
+    call_jax_direct(eflag, vflag, natoms_used, nneigh_max);
+  }
+  
+  double compute_time = MPI_Wtime() - compute_start_time;
+  total_optimization_time += compute_time;
+  optimization_call_count++;
+  
+  // Periodic performance logging
+  if (optimization_call_count % 100 == 0) {
+    log_optimization_performance();
+  }
+
+  if (vflag_fdotr) virial_fdotr_compute();
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairJaxMTPDirect::settings(int narg, char **arg)
+{
+  if (narg < 1) error->all(FLERR, "Illegal pair_style command");
+
+  std::string path_str(arg[0]);
+  
+  // Check if it's a file or directory
+  if (path_str.find(".bin") != std::string::npos) {
+    // Single file mode (legacy)
+    int n = strlen(arg[0]) + 1;
+    jax_function_path = new char[n];
+    strcpy(jax_function_path, arg[0]);
+    
+    // Extract max_atoms and max_neighbors from filename or arguments
+    if (narg >= 3) {
+      max_atoms = utils::inumeric(FLERR, arg[1], false, lmp);
+      max_neighbors = utils::inumeric(FLERR, arg[2], false, lmp);
+    } else {
+      // Default sizes for single file mode
+      max_atoms = 16384;
+      max_neighbors = 200;
+    }
+  } else {
+    // Directory mode (new dynamic selection)
+    jax_functions_dir = path_str;
+    
+    // Set maximum possible size (will be adjusted dynamically)
+    max_atoms = 131072;  // 128k atoms max
+    max_neighbors = 200;
+    
+    // In directory mode, argument 1 is max_neighbors
+    if (narg >= 2) max_neighbors = utils::inumeric(FLERR, arg[1], false, lmp);
+  }
+
+  if (max_atoms <= 0) error->all(FLERR, "Maximum atoms must be positive");
+  if (max_neighbors <= 0) error->all(FLERR, "Maximum neighbors must be positive");
+
+  cutoff = 5.0;  // Default cutoff
+  current_function_size = 0;  // No function loaded yet
+
+  if (comm->me == 0) {
+    utils::logmesg(lmp, "JAX/MTP Direct pair style settings:\n");
+    if (jax_functions_dir.empty()) {
+      utils::logmesg(lmp, "  Single JAX function file: {}\n", jax_function_path);
+      utils::logmesg(lmp, "  Fixed array size: {} atoms x {} neighbors\n", max_atoms, max_neighbors);
+    } else {
+      utils::logmesg(lmp, "  JAX functions directory: {}\n", jax_functions_dir.c_str());
+      utils::logmesg(lmp, "  Dynamic function selection: ENABLED\n");
+      utils::logmesg(lmp, "  Maximum capacity: {} atoms x {} neighbors\n", max_atoms, max_neighbors);
+    }
+    utils::logmesg(lmp, "  Default cutoff: {:.3f}\n", cutoff);
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairJaxMTPDirect::coeff(int narg, char **arg)
+{
+  if (narg != 2) error->all(FLERR, "Incorrect args for pair coefficients");
+  if (!allocated) allocate();
+
+  for (int i = 1; i <= atom->ntypes; i++) {
+    for (int j = 1; j <= atom->ntypes; j++) {
+      setflag[i][j] = 1;
+      cutsq[i][j] = cutoff * cutoff;
+    }
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+
+double PairJaxMTPDirect::init_one(int i, int j)
+{
+  if (setflag[i][j] == 0) error->all(FLERR, "All pair coeffs are not set");
+  return cutoff;
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairJaxMTPDirect::init_style()
+{
+  if (atom->tag_enable == 0)
+    error->all(FLERR, "Pair style jax/mtp_direct requires atom IDs");
+
+  // Validate that array sizes have been set
+  if (max_atoms <= 0 || max_neighbors <= 0) {
+    error->all(FLERR, "Array sizes not properly set - check pair_style arguments");
+  }
+
+  neighbor->add_request(this, NeighConst::REQ_FULL);
+
+  // Initialize Python and JAX
+  if (!python_initialized) {
+    init_python();
+    
+    if (!jax_functions_dir.empty()) {
+      // Dynamic function selection mode
+      initialize_function_mapping();
+    } else {
+      // Single function mode
+      if (!load_jax_function()) {
+        error->all(FLERR, "Failed to load JAX function");
+      }
+    }
+    
+    // Create reusable arrays
+    create_reusable_arrays();
+    
+    // NEW: Initialize optimized interface
+    init_optimized_interface();
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairJaxMTPDirect::allocate()
+{
+  allocated = 1;
+  int n = atom->ntypes;
+
+  memory->create(setflag, n + 1, n + 1, "pair:setflag");
+  for (int i = 1; i <= n; i++)
+    for (int j = i; j <= n; j++)
+      setflag[i][j] = 0;
+
+  memory->create(cutsq, n + 1, n + 1, "pair:cutsq");
+}
+
+/* ---------------------------------------------------------------------- */
+
+// NEW: Initialize optimized interface
+void PairJaxMTPDirect::init_optimized_interface()
+{
+  if (!Py_IsInitialized()) {
+    if (comm->me == 0) {
+      utils::logmesg(lmp, "JAX-MTP: ⚠️  Python not initialized, disabling optimization\n");
+    }
+    use_optimized_interface = false;
+    return;
+  }
+  
+  try {
+    // Import optimization module
+    PyObject *opt_module = PyImport_ImportModule("ultimate_interface_optimizer");
+    if (!opt_module) {
+      PyErr_Clear();  // Clear the error
+      if (comm->me == 0) {
+        utils::logmesg(lmp, "JAX-MTP: ⚠️  Could not import optimization module, using fallback\n");
+      }
+      use_optimized_interface = false;
+      return;
+    }
+    
+    // Get factory function
+    PyObject *create_optimizer_func = PyObject_GetAttrString(opt_module, "create_ultimate_optimizer");
+    if (!create_optimizer_func) {
+      Py_DECREF(opt_module);
+      PyErr_Clear();
+      if (comm->me == 0) {
+        utils::logmesg(lmp, "JAX-MTP: ⚠️  Could not get create_ultimate_optimizer function\n");
+      }
+      use_optimized_interface = false;
+      return;
+    }
+    
+    // Create optimizer instance with current max_atoms and max_neighbors
+    PyObject *args = PyTuple_New(2);
+    PyTuple_SetItem(args, 0, PyLong_FromLong(max_atoms));
+    PyTuple_SetItem(args, 1, PyLong_FromLong(max_neighbors));
+    
+    ultimate_optimizer = PyObject_CallObject(create_optimizer_func, args);
+    
+    Py_DECREF(args);
+    Py_DECREF(create_optimizer_func);
+    Py_DECREF(opt_module);
+    
+    if (!ultimate_optimizer) {
+      PyErr_Clear();
+      if (comm->me == 0) {
+        utils::logmesg(lmp, "JAX-MTP: ⚠️  Failed to create optimizer instance\n");
+      }
+      use_optimized_interface = false;
+      return;
+    }
+    
+    // Create MTP parameters dictionary for optimizer
+    create_mtp_params_dict();
+    
+    // Load function into optimizer
+    if (mtp_params_dict) {
+      PyObject *load_method = PyObject_GetAttrString(ultimate_optimizer, "load_jax_function");
+      if (load_method) {
+        PyObject *load_args = PyTuple_New(2);
+        PyTuple_SetItem(load_args, 0, PyUnicode_FromString("lammps_jax_function"));
+        PyTuple_SetItem(load_args, 1, mtp_params_dict);
+        Py_INCREF(mtp_params_dict);  // Increase reference count
+        
+        PyObject *load_result = PyObject_CallObject(load_method, load_args);
+        if (!load_result) {
+          PyErr_Clear();
+          if (comm->me == 0) {
+            utils::logmesg(lmp, "JAX-MTP: ⚠️  Failed to load function into optimizer\n");
+          }
+          use_optimized_interface = false;
+        } else {
+          Py_DECREF(load_result);
+        }
+        
+        Py_DECREF(load_args);
+        Py_DECREF(load_method);
+      }
+    }
+    
+    if (use_optimized_interface && comm->me == 0) {
+      utils::logmesg(lmp, "JAX-MTP: ✅ Ultimate interface optimization enabled\n");
+    }
+    
+  } catch (...) {
+    if (comm->me == 0) {
+      utils::logmesg(lmp, "JAX-MTP: ⚠️  Exception during optimization init, using fallback\n");
+    }
+    use_optimized_interface = false;
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+
+// NEW: Create MTP parameters dictionary
+void PairJaxMTPDirect::create_mtp_params_dict()
+{
+  // Create a mock MTP parameters dictionary
+  // In a real implementation, these would be loaded from your .mtp file
+  mtp_params_dict = PyDict_New();
+  if (!mtp_params_dict) return;
+  
+  // Mock species array
+  npy_intp species_dims[1] = {2};
+  PyObject *species_array = PyArray_SimpleNew(1, species_dims, NPY_INT32);
+  int32_t *species_data = (int32_t*)PyArray_DATA((PyArrayObject*)species_array);
+  species_data[0] = 1;
+  species_data[1] = 2;
+  PyDict_SetItemString(mtp_params_dict, "species", species_array);
+  Py_DECREF(species_array);
+  
+  // Mock scalar parameters
+  PyDict_SetItemString(mtp_params_dict, "scaling", PyFloat_FromDouble(1.0));
+  PyDict_SetItemString(mtp_params_dict, "min_dist", PyFloat_FromDouble(0.5));
+  PyDict_SetItemString(mtp_params_dict, "max_dist", PyFloat_FromDouble(5.0));
+  
+  // Mock coefficient arrays (you would load these from your actual .mtp file)
+  npy_intp coeff_dims[3] = {4, 10, 5};
+  PyObject *species_coeffs = PyArray_SimpleNew(3, coeff_dims, NPY_FLOAT32);
+  PyObject *moment_coeffs = PyArray_SimpleNew(3, coeff_dims, NPY_FLOAT32);
+  
+  npy_intp radial_dims[4] = {4, 10, 5, 20};
+  PyObject *radial_coeffs = PyArray_SimpleNew(4, radial_dims, NPY_FLOAT32);
+  
+  // Fill with small random values (replace with actual MTP coefficients)
+  float *species_data_f = (float*)PyArray_DATA((PyArrayObject*)species_coeffs);
+  float *moment_data_f = (float*)PyArray_DATA((PyArrayObject*)moment_coeffs);
+  float *radial_data_f = (float*)PyArray_DATA((PyArrayObject*)radial_coeffs);
+  
+  int species_size = 4 * 10 * 5;
+  int radial_size = 4 * 10 * 5 * 20;
+  
+  for (int i = 0; i < species_size; i++) {
+    species_data_f[i] = 0.01f * (rand() % 100 - 50);
+    moment_data_f[i] = 0.01f * (rand() % 100 - 50);
+  }
+  
+  for (int i = 0; i < radial_size; i++) {
+    radial_data_f[i] = 0.01f * (rand() % 100 - 50);
+  }
+  
+  PyDict_SetItemString(mtp_params_dict, "species_coeffs", species_coeffs);
+  PyDict_SetItemString(mtp_params_dict, "moment_coeffs", moment_coeffs);
+  PyDict_SetItemString(mtp_params_dict, "radial_coeffs", radial_coeffs);
+  
+  Py_DECREF(species_coeffs);
+  Py_DECREF(moment_coeffs);
+  Py_DECREF(radial_coeffs);
+  
+  // Mock execution order and scalar contractions
+  PyObject *exec_order = PyList_New(3);
+  PyList_SetItem(exec_order, 0, PyLong_FromLong(1));
+  PyList_SetItem(exec_order, 1, PyLong_FromLong(2));
+  PyList_SetItem(exec_order, 2, PyLong_FromLong(3));
+  PyDict_SetItemString(mtp_params_dict, "execution_order", exec_order);
+  Py_DECREF(exec_order);
+  
+  PyObject *scalar_contractions = PyList_New(3);
+  PyList_SetItem(scalar_contractions, 0, PyBool_FromLong(1));
+  PyList_SetItem(scalar_contractions, 1, PyBool_FromLong(0));
+  PyList_SetItem(scalar_contractions, 2, PyBool_FromLong(1));
+  PyDict_SetItemString(mtp_params_dict, "scalar_contractions", scalar_contractions);
+  Py_DECREF(scalar_contractions);
+}
+
+/* ---------------------------------------------------------------------- */
+
+// NEW: Cleanup optimized interface
+void PairJaxMTPDirect::cleanup_optimized_interface()
+{
+  // Log final performance stats
+  if (use_optimized_interface && optimization_call_count > 0) {
+    log_optimization_performance();
+    
+    if (comm->me == 0) {
+      double avg_time_ms = (total_optimization_time / optimization_call_count) * 1000.0;
+      utils::logmesg(lmp, "JAX-MTP Final Stats: {} calls, avg {:.2f} ms, best speedup {:.1f}x\n",
+                     optimization_call_count, avg_time_ms, best_speedup_achieved);
+    }
+  }
+  
+  Py_XDECREF(ultimate_optimizer);
+  Py_XDECREF(optimization_config);
+  Py_XDECREF(mtp_params_dict);
+  
+  ultimate_optimizer = nullptr;
+  optimization_config = nullptr;
+  mtp_params_dict = nullptr;
+}
+
+/* ---------------------------------------------------------------------- */
+
+// NEW: Optimized JAX interface call
+void PairJaxMTPDirect::call_jax_optimized(int eflag, int vflag, int natoms_used, int nneigh_max)
+{
+  // Get compute method from optimizer
+  PyObject *compute_method = PyObject_GetAttrString(ultimate_optimizer, "compute_energy_forces_stress");
+  if (!compute_method) {
+    PyErr_Clear();
+    if (comm->me == 0) {
+      utils::logmesg(lmp, "JAX-MTP: ⚠️  Could not get compute method, falling back\n");
+    }
+    // Fallback to original method
+    use_optimized_interface = false;
+    call_jax_direct(eflag, vflag, natoms_used, nneigh_max);
+    return;
+  }
+  
+  // Prepare arguments - use pre-allocated arrays
+  PyObject *args = PyTuple_New(9);
+  
+  // Set arguments (increment ref counts for borrowing)
+  Py_INCREF(itypes_array);
+  Py_INCREF(all_js_array);
+  Py_INCREF(all_rijs_array);
+  Py_INCREF(all_jtypes_array);
+  Py_INCREF(cell_rank_obj);
+  Py_INCREF(volume_obj);
+  Py_INCREF(natoms_actual_obj);
+  Py_INCREF(nneigh_actual_obj);
+  Py_INCREF(mtp_params_dict);
+  
+  PyTuple_SetItem(args, 0, itypes_array);
+  PyTuple_SetItem(args, 1, all_js_array);
+  PyTuple_SetItem(args, 2, all_rijs_array);
+  PyTuple_SetItem(args, 3, all_jtypes_array);
+  PyTuple_SetItem(args, 4, cell_rank_obj);
+  PyTuple_SetItem(args, 5, volume_obj);
+  PyTuple_SetItem(args, 6, natoms_actual_obj);
+  PyTuple_SetItem(args, 7, nneigh_actual_obj);
+  PyTuple_SetItem(args, 8, mtp_params_dict);
+  
+  // Call optimized compute function
+  PyObject *result = PyObject_CallObject(compute_method, args);
+  
+  if (!result) {
+    PyErr_Print();
+    if (comm->me == 0) {
+      utils::logmesg(lmp, "JAX-MTP: ❌ Optimized compute failed, disabling optimization\n");
+    }
+    use_optimized_interface = false;
+    Py_DECREF(args);
+    Py_DECREF(compute_method);
+    // Call fallback
+    call_jax_direct(eflag, vflag, natoms_used, nneigh_max);
+    return;
+  }
+  
+  // Extract results (same process as original)
+  extract_results_from_python(result, eflag, vflag, natoms_used);
+  
+  Py_DECREF(result);
+  Py_DECREF(compute_method);
+  Py_DECREF(args);
+}
+
+/* ---------------------------------------------------------------------- */
+
+// NEW: Performance logging
+void PairJaxMTPDirect::log_optimization_performance()
+{
+  if (comm->me == 0 && optimization_call_count > 0) {
+    
+    double avg_time_ms = (total_optimization_time / optimization_call_count) * 1000.0;
+    
+    // Try to get detailed stats from optimizer
+    if (ultimate_optimizer && use_optimized_interface) {
+      PyObject *get_stats_method = PyObject_GetAttrString(ultimate_optimizer, "get_performance_summary");
+      if (get_stats_method) {
+        PyObject *stats = PyObject_CallObject(get_stats_method, nullptr);
+        if (stats && PyDict_Check(stats)) {
+          
+          PyObject *total_speedup = PyDict_GetItemString(stats, "total_speedup");
+          PyObject *avg_interface_time = PyDict_GetItemString(stats, "avg_interface_time_ms");
+          
+          if (total_speedup && avg_interface_time) {
+            double speedup = PyFloat_AsDouble(total_speedup);
+            double interface_time = PyFloat_AsDouble(avg_interface_time);
+            
+            if (speedup > best_speedup_achieved) {
+              best_speedup_achieved = speedup;
+            }
+            
+            utils::logmesg(lmp, "JAX-MTP Optimization Stats (after {} calls):\n", optimization_call_count);
+            utils::logmesg(lmp, "  Average interface time: {:.2f} ms\n", interface_time);
+            utils::logmesg(lmp, "  Interface speedup: {:.1f}x\n", speedup);
+            utils::logmesg(lmp, "  Best speedup achieved: {:.1f}x\n", best_speedup_achieved);
+            
+            // Check if target achieved
+            if (speedup >= 2.0) {
+              utils::logmesg(lmp, "  🎯 Target speedup achieved: ✅ YES\n");
+            } else {
+              utils::logmesg(lmp, "  🎯 Target speedup achieved: ❌ NO (need 2.0x)\n");
+            }
+          }
+        }
+        Py_XDECREF(stats);
+        Py_DECREF(get_stats_method);
+      }
+    } else {
+      // Basic stats without detailed breakdown
+      utils::logmesg(lmp, "JAX-MTP Stats (after {} calls): avg {:.2f} ms/call\n", 
+                     optimization_call_count, avg_time_ms);
+    }
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+
+int PairJaxMTPDirect::init_python()
+{
+  if (python_initialized) return 1;
+
+  if (!Py_IsInitialized()) {
+    Py_Initialize();
+  }
+
+  if (!Py_IsInitialized()) {
+    error->all(FLERR, "Failed to initialize Python interpreter");
+    return 0;
+  }
+
+  // Import NumPy
+  if (import_array() < 0) {
+    error->all(FLERR, "Failed to import NumPy C API");
+    return 0;
+  }
+
+  // Import JAX export module
+  jax_export_module = PyImport_ImportModule("jax.export");
+  if (jax_export_module == nullptr) {
+    PyErr_Print();
+    error->all(FLERR, "Failed to import jax.export module");
+    return 0;
+  }
+
+  python_initialized = true;
+  
+  if (comm->me == 0) {
+    utils::logmesg(lmp, "Python and JAX successfully initialized\n");
+  }
+
+  return 1;
+}
+
+/* ---------------------------------------------------------------------- */
+
+int PairJaxMTPDirect::load_jax_function()
+{
+  if (jax_function_path == nullptr) return 0;
+
+  PyObject *deserialize_func = PyObject_GetAttrString(jax_export_module, "deserialize");
+  if (deserialize_func == nullptr) {
+    PyErr_Print();
+    return 0;
+  }
+
+  FILE *file = fopen(jax_function_path, "rb");
+  if (!file) {
+    if (comm->me == 0) {
+      utils::logmesg(lmp, "Error: Cannot open JAX function file: {}\n", jax_function_path);
+    }
+    Py_DECREF(deserialize_func);
+    return 0;
+  }
+
+  fseek(file, 0, SEEK_END);
+  long file_size = ftell(file);
+  fseek(file, 0, SEEK_SET);
+
+  char *file_data = new char[file_size];
+  size_t bytes_read = fread(file_data, 1, file_size, file);
+  fclose(file);
+
+  if (bytes_read != file_size) {
+    if (comm->me == 0) {
+      utils::logmesg(lmp, "Error: Failed to read complete JAX function file\n");
+    }
+    delete[] file_data;
+    Py_DECREF(deserialize_func);
+    return 0;
+  }
+
+  PyObject *serialized_data = PyBytes_FromStringAndSize(file_data, file_size);
+  delete[] file_data;
+
+  jax_function = PyObject_CallFunctionObjArgs(deserialize_func, serialized_data, nullptr);
+  
+  Py_DECREF(deserialize_func);
+  Py_DECREF(serialized_data);
+  
+  if (jax_function == nullptr) {
+    PyErr_Print();
+    if (comm->me == 0) {
+      utils::logmesg(lmp, "Error: Failed to deserialize JAX function\n");
+    }
+    return 0;
+  }
+
+  if (comm->me == 0) {
+    utils::logmesg(lmp, "Successfully loaded JAX function from: {}\n", jax_function_path);
+  }
+
+  return 1;
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairJaxMTPDirect::create_reusable_arrays()
+{
+  // Create reusable NumPy arrays that will be updated with new data each timestep
+  npy_intp dims1[1] = {max_atoms};
+  npy_intp dims2[2] = {max_atoms, max_neighbors};
+  npy_intp dims3[3] = {max_atoms, max_neighbors, 3};
+
+  // Integer arrays
+  itypes_array = PyArray_ZEROS(1, dims1, NPY_INT32, 0);
+  all_js_array = PyArray_ZEROS(2, dims2, NPY_INT32, 0);
+  all_jtypes_array = PyArray_ZEROS(2, dims2, NPY_INT32, 0);
+
+  // Float arrays
+  all_rijs_array = PyArray_ZEROS(3, dims3, NPY_FLOAT32, 0);
+
+  // Scalar objects
+  cell_rank_obj = PyLong_FromLong(3);  // 3D simulation
+  volume_obj = PyFloat_FromDouble(1000.0);  // Will be updated
+  natoms_actual_obj = PyLong_FromLong(0);  // Will be updated
+  nneigh_actual_obj = PyLong_FromLong(0);  // Will be updated
+
+  if (!itypes_array || !all_js_array || !all_rijs_array || !all_jtypes_array ||
+      !cell_rank_obj || !volume_obj || !natoms_actual_obj || !nneigh_actual_obj) {
+    error->all(FLERR, "Failed to create reusable NumPy arrays");
+  }
+
+  if (comm->me == 0) {
+    utils::logmesg(lmp, "Created reusable arrays: {} atoms x {} neighbors\n", max_atoms, max_neighbors);
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairJaxMTPDirect::update_array_data(int natoms_used, int nneigh_max, int inum, int *ilist, int *numneigh, int **firstneigh)
+{
+  double **x = atom->x;
+  int *type = atom->type;
+  
+  // Get array data pointers
+  int32_t *itypes_data = (int32_t*)PyArray_DATA((PyArrayObject*)itypes_array);
+  int32_t *all_js_data = (int32_t*)PyArray_DATA((PyArrayObject*)all_js_array);
+  int32_t *all_jtypes_data = (int32_t*)PyArray_DATA((PyArrayObject*)all_jtypes_array);
+  float *all_rijs_data = (float*)PyArray_DATA((PyArrayObject*)all_rijs_array);
+
+  // Clear arrays first
+  memset(itypes_data, 0, max_atoms * sizeof(int32_t));
+  memset(all_js_data, 0, max_atoms * max_neighbors * sizeof(int32_t));
+  memset(all_jtypes_data, 0, max_atoms * max_neighbors * sizeof(int32_t));
+  memset(all_rijs_data, 0, max_atoms * max_neighbors * 3 * sizeof(float));
+
+  // Fill with actual data
+  for (int ii = 0; ii < inum; ii++) {
+    int i = ilist[ii];
+    int jnum = numneigh[i];
+    int *jlist = firstneigh[i];
+
+    // Atom type (1-indexed in LAMMPS, convert to 0-indexed)
+    itypes_data[ii] = type[i] - 1;
+
+    double xi = x[i][0];
+    double yi = x[i][1];
+    double zi = x[i][2];
+
+    for (int jj = 0; jj < jnum && jj < max_neighbors; jj++) {
+      int j = jlist[jj];
+      j &= NEIGHMASK;  // Remove special bond flags
+
+      // Neighbor index and type
+      all_js_data[ii * max_neighbors + jj] = j;
+      all_jtypes_data[ii * max_neighbors + jj] = type[j] - 1;
+
+      // Relative position vector
+      double delx = x[j][0] - xi;
+      double dely = x[j][1] - yi;
+      double delz = x[j][2] - zi;
+
+      all_rijs_data[(ii * max_neighbors + jj) * 3 + 0] = (float)delx;
+      all_rijs_data[(ii * max_neighbors + jj) * 3 + 1] = (float)dely;
+      all_rijs_data[(ii * max_neighbors + jj) * 3 + 2] = (float)delz;
+    }
+  }
+
+  // Update scalar values
+  Py_DECREF(volume_obj);
+  Py_DECREF(natoms_actual_obj);
+  Py_DECREF(nneigh_actual_obj);
+
+  volume_obj = PyFloat_FromDouble(domain->xprd * domain->yprd * domain->zprd);
+  natoms_actual_obj = PyLong_FromLong(natoms_used);
+  nneigh_actual_obj = PyLong_FromLong(nneigh_max);
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairJaxMTPDirect::call_jax_direct(int eflag, int vflag, int natoms_used, int nneigh_max)
+{
+  // This is the original (non-optimized) interface
+  PyObject *result = PyObject_CallFunctionObjArgs(
+    jax_function,
+    itypes_array,
+    all_js_array,
+    all_rijs_array,
+    all_jtypes_array,
+    cell_rank_obj,
+    volume_obj,
+    natoms_actual_obj,
+    nneigh_actual_obj,
+    nullptr
+  );
+
+  if (result == nullptr) {
+    PyErr_Print();
+    error->all(FLERR, "JAX function call failed");
+  }
+
+  extract_results_from_python(result, eflag, vflag, natoms_used);
+  
+  Py_DECREF(result);
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairJaxMTPDirect::extract_results_from_python(PyObject *result, int eflag, int vflag, int natoms_used)
+{
+  if (!PyTuple_Check(result) || PyTuple_Size(result) != 3) {
+    error->all(FLERR, "JAX function should return (energy, forces, stress)");
+  }
+
+  PyObject *energy_obj = PyTuple_GetItem(result, 0);
+  PyObject *forces_obj = PyTuple_GetItem(result, 1);
+  PyObject *stress_obj = PyTuple_GetItem(result, 2);
+
+  // Extract energy
+  double total_energy = 0.0;
+  if (PyFloat_Check(energy_obj)) {
+    total_energy = PyFloat_AsDouble(energy_obj);
+  } else if (PyArray_Check(energy_obj)) {
+    PyArrayObject *energy_array = (PyArrayObject*)energy_obj;
+    if (PyArray_NDIM(energy_array) == 0) {
+      total_energy = *(double*)PyArray_DATA(energy_array);
+    } else {
+      error->all(FLERR, "Energy should be a scalar");
+    }
+  }
+
+  // Extract forces
+  if (!PyArray_Check(forces_obj)) {
+    error->all(FLERR, "Forces should be a NumPy array");
+  }
+
+  PyArrayObject *forces_array = (PyArrayObject*)forces_obj;
+  if (PyArray_NDIM(forces_array) != 2) {
+    error->all(FLERR, "Forces array should be 2D");
+  }
+
+  float *forces_data = (float*)PyArray_DATA(forces_array);
+  
+  // Apply forces to LAMMPS atoms
+  double **f = atom->f;
+  int *ilist = list->ilist;
+  
+  for (int ii = 0; ii < natoms_used; ii++) {
+    int i = ilist[ii];
+    f[i][0] += (double)forces_data[ii * 3 + 0];
+    f[i][1] += (double)forces_data[ii * 3 + 1];
+    f[i][2] += (double)forces_data[ii * 3 + 2];
+  }
+
+  // Extract stress/virial
+  if (vflag) {
+    if (!PyArray_Check(stress_obj)) {
+      error->all(FLERR, "Stress should be a NumPy array");
+    }
+
+    PyArrayObject *stress_array = (PyArrayObject*)stress_obj;
+    float *stress_data = (float*)PyArray_DATA(stress_array);
+
+    // Convert from stress to virial and add to LAMMPS virial
+    // JAX returns stress in Voigt notation: [xx, yy, zz, yz, xz, xy]
+    virial[0] += -stress_data[0] * domain->xprd * domain->yprd * domain->zprd;  // xx
+    virial[1] += -stress_data[1] * domain->xprd * domain->yprd * domain->zprd;  // yy
+    virial[2] += -stress_data[2] * domain->xprd * domain->yprd * domain->zprd;  // zz
+    virial[3] += -stress_data[3] * domain->xprd * domain->yprd * domain->zprd;  // yz
+    virial[4] += -stress_data[4] * domain->xprd * domain->yprd * domain->zprd;  // xz
+    virial[5] += -stress_data[5] * domain->xprd * domain->yprd * domain->zprd;  // xy
+  }
+
+  // Add energy contribution
+  if (eflag) {
+    eng_vdwl += total_energy;
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairJaxMTPDirect::cleanup_arrays()
+{
+  Py_XDECREF(itypes_array);
+  Py_XDECREF(all_js_array);
+  Py_XDECREF(all_rijs_array);
+  Py_XDECREF(all_jtypes_array);
+  Py_XDECREF(cell_rank_obj);
+  Py_XDECREF(volume_obj);
+  Py_XDECREF(natoms_actual_obj);
+  Py_XDECREF(nneigh_actual_obj);
+
+  itypes_array = nullptr;
+  all_js_array = nullptr;
+  all_rijs_array = nullptr;
+  all_jtypes_array = nullptr;
+  cell_rank_obj = nullptr;
+  volume_obj = nullptr;
+  natoms_actual_obj = nullptr;
+  nneigh_actual_obj = nullptr;
+}
+
+/* ---------------------------------------------------------------------- */
+
+void PairJaxMTPDirect::cleanup_python()
+{
+  cleanup_arrays();
+
+  Py_XDECREF(jax_function);
+  Py_XDECREF(jax_export_module);
+
+  python_initialized = false;
+}
+
+/* ---------------------------------------------------------------------- */
+
+// NEW: Round up to next power of 2
+int PairJaxMTPDirect::round_up_to_power_of_2(int n, int min_val)
+{
+  if (n <= min_val) return min_val;
+  
+  int power = 1;
+  while (power < n) {
+    power *= 2;
+  }
+  return power;
+}
+
+/* ---------------------------------------------------------------------- */
+
+// NEW: Select optimal function size based on actual atom count
+int PairJaxMTPDirect::select_optimal_function_size(int natoms_actual)
+{
+  // Round up to next power of 2, minimum 1024
+  int required_size = round_up_to_power_of_2(natoms_actual, 1024);
+  
+  // Available function sizes (must match compilation script)
+  std::vector<int> available_sizes = {1024, 4096, 16384, 65536, 131072};
+  
+  // Find smallest available size that fits
+  for (int size : available_sizes) {
+    if (size >= required_size && function_files.find(size) != function_files.end()) {
+      return size;
+    }
+  }
+  
+  // Return largest available size if none fit
+  for (auto it = available_sizes.rbegin(); it != available_sizes.rend(); ++it) {
+    if (function_files.find(*it) != function_files.end()) {
+      return *it;
+    }
+  }
+  
+  // This shouldn't happen if initialize_function_mapping worked
+  error->one(FLERR, "No suitable JAX function found");
+  return 1024;
+}
+
+/* ---------------------------------------------------------------------- */
+
+// NEW: Get filename for function size
+std::string PairJaxMTPDirect::get_function_filename(int function_size)
+{
+  std::string suffix;
+  
+  switch (function_size) {
+    case 1024:   suffix = "1k"; break;
+    case 4096:   suffix = "4k"; break;
+    case 16384:  suffix = "16k"; break;
+    case 65536:  suffix = "64k"; break;
+    case 131072: suffix = "128k"; break;
+    default:
+      error->one(FLERR, "Unsupported function size requested");
+      return "";
+  }
+  
+  return jax_functions_dir + "/jax_potential_" + suffix + ".bin";
+}
+
+/* ---------------------------------------------------------------------- */
+
+// NEW: Initialize function mapping
+void PairJaxMTPDirect::initialize_function_mapping()
+{
+  // Create mapping of sizes to filenames
+  std::vector<int> sizes = {1024, 4096, 16384, 65536, 131072};
+  
+  if (comm->me == 0) {
+    utils::logmesg(lmp, "Scanning for JAX function files:\n");
+  }
+  
+  for (int size : sizes) {
+    std::string filename = get_function_filename(size);
+    
+    // Check if file exists
+    FILE *test_file = fopen(filename.c_str(), "rb");
+    if (test_file) {
+      fclose(test_file);
+      function_files[size] = filename;
+      
+      if (comm->me == 0) {
+        utils::logmesg(lmp, "   Found function: {} atoms -> {}\n", size, filename.c_str());
+      }
+    } else {
+      if (comm->me == 0) {
+        utils::logmesg(lmp, "   Missing function: {} atoms -> {}\n", size, filename.c_str());
+      }
+    }
+  }
+  
+  if (function_files.empty()) {
+    error->one(FLERR, "No JAX function files found in directory");
+  }
+  
+  if (comm->me == 0) {
+    utils::logmesg(lmp, "Found {} JAX function files\n", function_files.size());
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+
+// NEW: Load JAX function for specific size
+int PairJaxMTPDirect::load_jax_function_for_size(int function_size)
+{
+  // Check if already loaded
+  if (current_function_size == function_size && jax_function != nullptr) {
+    return 1;  // Already loaded
+  }
+  
+  // Check if function file exists
+  if (function_files.find(function_size) == function_files.end()) {
+    return 0;  // Function not available
+  }
+  
+  std::string filename = function_files[function_size];
+  
+  if (comm->me == 0 && current_function_size != function_size) {
+    utils::logmesg(lmp, "Loading JAX function: {} atoms from {}\n", function_size, filename.c_str());
+  }
+  
+  // Clean up previous function
+  if (jax_function != nullptr) {
+    Py_DECREF(jax_function);
+    jax_function = nullptr;
+  }
+  
+  // Load new function
+  PyObject *deserialize_func = PyObject_GetAttrString(jax_export_module, "deserialize");
+  if (deserialize_func == nullptr) {
+    return 0;
+  }
+
+  FILE *file = fopen(filename.c_str(), "rb");
+  if (!file) {
+    Py_DECREF(deserialize_func);
+    return 0;
+  }
+
+  fseek(file, 0, SEEK_END);
+  long file_size = ftell(file);
+  fseek(file, 0, SEEK_SET);
+
+  char *file_data = new char[file_size];
+  size_t bytes_read = fread(file_data, 1, file_size, file);
+  fclose(file);
+
+  if (bytes_read != file_size) {
+    delete[] file_data;
+    Py_DECREF(deserialize_func);
+    return 0;
+  }
+
+  PyObject *serialized_data = PyBytes_FromStringAndSize(file_data, file_size);
+  delete[] file_data;
+
+  jax_function = PyObject_CallFunctionObjArgs(deserialize_func, serialized_data, nullptr);
+  
+  Py_DECREF(deserialize_func);
+  Py_DECREF(serialized_data);
+  
+  if (jax_function == nullptr) {
+    PyErr_Print();
+    return 0;
+  }
+  
+  current_function_size = function_size;
+  
+  // Update max_atoms to match loaded function
+  max_atoms = function_size;
+  
+  // Recreate arrays with new size if needed
+  if (itypes_array == nullptr) {
+    create_reusable_arrays();
+  } else {
+    // Arrays already exist, check if they need to be resized
+    npy_intp *dims = PyArray_DIMS((PyArrayObject*)itypes_array);
+    if (dims[0] != max_atoms) {
+      cleanup_arrays();
+      create_reusable_arrays();
+    }
+  }
+  
+  // Load into optimizer if available
+  if (use_optimized_interface && ultimate_optimizer && mtp_params_dict) {
+    PyObject *load_method = PyObject_GetAttrString(ultimate_optimizer, "load_jax_function");
+    if (load_method) {
+      PyObject *args = PyTuple_New(2);
+      PyTuple_SetItem(args, 0, PyUnicode_FromString(filename.c_str()));
+      PyTuple_SetItem(args, 1, mtp_params_dict);
+      Py_INCREF(mtp_params_dict);
+      
+      PyObject *result = PyObject_CallObject(load_method, args);
+      if (!result) {
+        PyErr_Clear();
+        if (comm->me == 0) {
+          utils::logmesg(lmp, "⚠️  Failed to load function into optimizer, using fallback\n");
+        }
+        use_optimized_interface = false;
+      }
+      
+      Py_XDECREF(result);
+      Py_DECREF(args);
+      Py_DECREF(load_method);
+    }
+  }
+  
+  return 1;
+}
+
+/* ---------------------------------------------------------------------- */
+
+PyObject *PairJaxMTPDirect::create_numpy_array_int32(int *data, int dim1)
+{
+  npy_intp dims[1] = {dim1};
+  PyObject *array = PyArray_SimpleNew(1, dims, NPY_INT32);
+  int32_t *array_data = (int32_t*)PyArray_DATA((PyArrayObject*)array);
+  for (int i = 0; i < dim1; i++) {
+    array_data[i] = data[i];
+  }
+  return array;
+}
+
+PyObject *PairJaxMTPDirect::create_numpy_array_int32_2d(int **data, int dim1, int dim2)
+{
+  npy_intp dims[2] = {dim1, dim2};
+  PyObject *array = PyArray_SimpleNew(2, dims, NPY_INT32);
+  int32_t *array_data = (int32_t*)PyArray_DATA((PyArrayObject*)array);
+  for (int i = 0; i < dim1; i++) {
+    for (int j = 0; j < dim2; j++) {
+      array_data[i * dim2 + j] = data[i][j];
+    }
+  }
+  return array;
+}
+
+PyObject *PairJaxMTPDirect::create_numpy_array_float32_3d(double ***data, int dim1, int dim2, int dim3)
+{
+  npy_intp dims[3] = {dim1, dim2, dim3};
+  PyObject *array = PyArray_SimpleNew(3, dims, NPY_FLOAT32);
+  float *array_data = (float*)PyArray_DATA((PyArrayObject*)array);
+  for (int i = 0; i < dim1; i++) {
+    for (int j = 0; j < dim2; j++) {
+      for (int k = 0; k < dim3; k++) {
+        array_data[i * dim2 * dim3 + j * dim3 + k] = (float)data[i][j][k];
+      }
+    }
+  }
+  return array;
+}
+
+void PairJaxMTPDirect::extract_numpy_array_float32_2d(PyObject *array, double **data, int dim1, int dim2)
+{
+  if (PyArray_Check(array)) {
+    PyArrayObject *np_array = (PyArrayObject*)array;
+    float *array_data = (float*)PyArray_DATA(np_array);
+    for (int i = 0; i < dim1; i++) {
+      for (int j = 0; j < dim2; j++) {
+        data[i][j] = (double)array_data[i * dim2 + j];
+      }
+    }
+  }
+}
+
+void PairJaxMTPDirect::extract_numpy_array_float32_1d(PyObject *array, double *data, int dim1)
+{
+  if (PyArray_Check(array)) {
+    PyArrayObject *np_array = (PyArrayObject*)array;
+    float *array_data = (float*)PyArray_DATA(np_array);
+    for (int i = 0; i < dim1; i++) {
+      data[i] = (double)array_data[i];
+    }
+  }
+}
